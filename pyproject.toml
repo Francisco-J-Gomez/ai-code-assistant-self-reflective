@@ -1,7 +1,7 @@
 [project]
-name = "ai-code-assistant"
+name = "ai-code-assistant-self-reflective"
 version = "0.1.0"
-description = "Agentic RAG assistant that answers AI and software-development questions from arXiv papers, with web-search fallback"
+description = "Self-reflective agentic RAG assistant over arXiv that evaluates its own answers and refines them with extra tools when needed"
 readme = "README.md"
 authors = [
     { name = "Francisco Javier Gomez Sanchez", email = "gomez.sanchez.francisco@gmail.com" }

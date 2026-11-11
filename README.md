@@ -1,4 +1,6 @@
-# AI Code Assistant — an agentic RAG assistant over arXiv
+# AI Code Assistant (Self-Reflective) — a self-evaluating agentic RAG assistant over arXiv
+
+> Built on [ai-code-assistant](https://github.com/Francisco-J-Gomez/ai-code-assistant). This version adds self-reflection: the agent evaluates its RAG answers and uses extra tools and techniques to improve them when needed. _(Work in progress.)_
 
 A research assistant for AI and software-development questions, grounded in
 ~30k arXiv papers (2020–present). Ask a question in a chat UI and an
