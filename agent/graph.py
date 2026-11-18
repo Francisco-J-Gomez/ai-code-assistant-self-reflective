@@ -1,3 +1,5 @@
+import asyncio
+
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
@@ -39,15 +41,21 @@ without searching first.
 """
 
 
-def build_agent(config: AgentConfig | None = None):
+def build_agent(config: AgentConfig | None = None, *, checkpointer=None):
     """Compile the retrieval agent: search_papers (corpus) -> web_search
     (Tavily fallback) -> honest "nothing found" as a last resort.
 
-    checkpointer=InMemorySaver() gives per-thread_id conversation memory,
+    Defaults to InMemorySaver(): per-thread_id conversation memory,
     process-local only (lost on restart) - fine for a single-user local
-    chat session (docs/agent-plan.md step 3).
+    chat session (docs/agent-plan.md step 3). Pass checkpointer=False to
+    compile without one (LangGraph Studio / `langgraph dev` supplies its own
+    persistence - see studio_graph below).
     """
     config = config or AgentConfig()
+    if checkpointer is None:
+        checkpointer = InMemorySaver()
+    elif checkpointer is False:
+        checkpointer = None
 
     llm = ChatOpenAI(model=config.llm_model, temperature=config.llm_temperature)
     search_papers = make_search_papers_tool(config)
@@ -57,5 +65,17 @@ def build_agent(config: AgentConfig | None = None):
         model=llm,
         tools=[search_papers, web_search],
         system_prompt=SYSTEM_PROMPT,
-        checkpointer=InMemorySaver(),
+        checkpointer=checkpointer,
     )
+
+
+async def studio_graph():
+    """Graph factory for `langgraph dev` (see langgraph.json). A zero-arg
+    factory so the CLI doesn't pass its RunnableConfig in as AgentConfig,
+    and no checkpointer because the LangGraph server manages persistence.
+
+    Async + to_thread because building the agent does blocking network I/O
+    (PineconeStore.__init__ checks/connects to the index), which the
+    LangGraph server rejects when done on its event loop.
+    """
+    return await asyncio.to_thread(build_agent, checkpointer=False)
