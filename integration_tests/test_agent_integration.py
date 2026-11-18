@@ -51,15 +51,39 @@ def test_in_corpus_question_answers_from_corpus_only(graph):
     assert "arxiv" in answer or "corpus" in answer or "paper" in answer
 
 
-def test_in_scope_question_not_in_corpus_falls_back_to_web_search(graph):
+def test_tool_question_is_routed_straight_to_web_search(graph):
     result = _ask(
         graph,
         "How do you add a human-in-the-loop approval step to a LangGraph agent using interrupt()?",
-        "integration-test-web-fallback",
+        "integration-test-web-route",
     )
 
     assert result["route"] == "web"
-    assert any(d.kind == "web" for d in result["documents"])
+    # Routed to the web up front: the corpus was never searched.
+    assert result["documents"] and all(d.kind == "web" for d in result["documents"])
+
+
+def test_research_question_the_corpus_cannot_answer_falls_back_to_web(graph):
+    # Routed to the corpus (it asks about a specific paper), but the
+    # RepoCoder text says nothing about GPT-7 or SWE-bench, so check_corpus
+    # sends it on to the web. False premise: GPT-7 doesn't exist and
+    # RepoCoder evaluated on RepoEval.
+    result = _ask(
+        graph,
+        "What pass@1 did GPT-7 achieve on SWE-bench in the RepoCoder paper?",
+        "integration-test-corpus-fallback",
+    )
+
+    assert result["route"] == "web"
+    kinds = [d.kind for d in result["documents"]]
+    assert "corpus" in kinds and "web" in kinds  # corpus searched first, then web
+
+    # Web sources were used, so the answer says so (the label is chosen by
+    # the graph from the documents, not by the model).
+    assert "web search" in result["messages"][-1].content.lower()
+    # Not asserted: that the answer doesn't close with an offer ("if you can
+    # provide the paper..."). gpt-5-mini still does that in ~1 of 3 trap
+    # answers despite the prompt; Phase 4's reflect step is the fix.
 
 
 def test_out_of_scope_question_is_declined_without_retrieval(graph):
@@ -81,5 +105,5 @@ def test_follow_up_is_resolved_from_conversation_history(graph):
     result = _ask(graph, "What benchmark did they introduce to evaluate it?", "integration-test-follow-up")
 
     assert result["route"] in ("corpus", "web")
-    assert "repocoder" in result["search_query"].lower()
+    assert "repocoder" in result["standalone_question"].lower()
     assert "repoeval" in result["messages"][-1].content.lower()

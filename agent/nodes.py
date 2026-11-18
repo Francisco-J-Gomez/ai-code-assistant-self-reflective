@@ -30,17 +30,26 @@ def split_latest_question(messages: list[AnyMessage]) -> tuple[str, list[AnyMess
 # --- nodes -----------------------------------------------------------------
 
 
-def scope_check(state: AgentState, c: AgentComponents) -> dict:
-    """Decide scope and write a standalone search query. Also the start of
-    every turn, so it resets the per-turn fields."""
+def contextualize(state: AgentState, c: AgentComponents) -> dict:
+    """Turn the latest message into a standalone question, so follow-ups
+    ("what benchmark did they introduce?") route and retrieve correctly.
+    Skips the LLM on the first turn - there is nothing to resolve.
+
+    Also the start of every turn, so it resets the per-turn fields.
+    """
     question, history = split_latest_question(state.messages)
-    decision = c.scope_check(question, history)
+    standalone = (c.contextualize(question, history) if history else "") or question
     return {
         "question": question,
-        "search_query": decision.search_query or question,
-        "route": None if decision.in_scope else "decline",
+        "standalone_question": standalone,
+        "route": None,
         "documents": [],  # reset: state persists across turns
     }
+
+
+def router(state: AgentState, c: AgentComponents) -> dict:
+    decision = c.route(state.standalone_question)
+    return {"route": "decline" if decision.route == "out_of_scope" else decision.route}
 
 
 def decline(state: AgentState, c: AgentComponents) -> dict:
@@ -48,18 +57,18 @@ def decline(state: AgentState, c: AgentComponents) -> dict:
 
 
 def retrieve_corpus(state: AgentState, c: AgentComponents) -> dict:
-    return {"documents": c.search_corpus(state.search_query)}
+    return {"documents": c.search_corpus(state.standalone_question)}
 
 
 def check_corpus(state: AgentState, c: AgentComponents) -> dict:
-    verdict = c.check_corpus(state.question, state.documents)
+    verdict = c.check_corpus(state.standalone_question, state.documents)
     return {"route": "corpus" if verdict.answers_question else "web"}
 
 
 def web_search(state: AgentState, c: AgentComponents) -> dict:
-    # Keep the corpus documents too: generate may still use a relevant
-    # paper, and the evals measure corpus retrieval on every in-scope turn.
-    return {"documents": [*state.documents, *c.search_web(state.search_query)]}
+    # On the fallback path, keep the corpus documents too: generate may still
+    # use a relevant paper. (On the direct web route there are none.)
+    return {"documents": [*state.documents, *c.search_web(state.standalone_question)]}
 
 
 def generate(state: AgentState, c: AgentComponents) -> dict:
@@ -71,8 +80,8 @@ def generate(state: AgentState, c: AgentComponents) -> dict:
 # --- routing (conditional edges) -------------------------------------------
 
 
-def route_after_scope_check(state: AgentState) -> Literal["decline", "retrieve_corpus"]:
-    return "decline" if state.route == "decline" else "retrieve_corpus"
+def route_after_router(state: AgentState) -> Literal["decline", "retrieve_corpus", "web_search"]:
+    return {"decline": "decline", "web": "web_search"}.get(state.route, "retrieve_corpus")
 
 
 def route_after_check_corpus(state: AgentState) -> Literal["generate", "web_search"]:

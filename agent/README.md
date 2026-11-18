@@ -35,19 +35,22 @@ structure (`graph.get_graph().draw_mermaid()`, not hand-drawn):
 ```mermaid
 graph TD;
 	__start__([<p>__start__</p>]):::first
-	scope_check(scope_check)
+	contextualize(contextualize)
+	router(router)
 	decline(decline)
 	retrieve_corpus(retrieve_corpus)
 	check_corpus(check_corpus)
 	web_search(web_search)
 	generate(generate)
 	__end__([<p>__end__</p>]):::last
-	__start__ --> scope_check;
+	__start__ --> contextualize;
 	check_corpus -.-> generate;
 	check_corpus -.-> web_search;
+	contextualize --> router;
 	retrieve_corpus --> check_corpus;
-	scope_check -.-> decline;
-	scope_check -.-> retrieve_corpus;
+	router -.-> decline;
+	router -.-> retrieve_corpus;
+	router -.-> web_search;
 	web_search --> generate;
 	decline --> __end__;
 	generate --> __end__;
@@ -57,23 +60,33 @@ graph TD;
 ```
 
 Control flow is enforced by the graph's edges, not by a system prompt the
-LLM may or may not follow. There is no loop: a turn makes at most 3 LLM
-calls (scope check, corpus check, generation).
+LLM may or may not follow. There is no loop: a turn makes at most 4 LLM
+calls (contextualize on follow-ups, router, corpus check, generation).
 
-1. **`scope_check`** (LLM, structured output `ScopeDecision`): is the latest
-   message about AI / software development? Also rewrites it as a
-   self-contained search query using the conversation, so follow-ups ("what
-   benchmark did *they* introduce?") retrieve the right papers. Resets the
-   per-turn state (the checkpointer keeps state across turns).
-2. **`decline`**: out of scope → fixed message, no retrieval, no generation.
-3. **`retrieve_corpus`**: embeds the search query and retrieves the top-k
-   chunks from Pinecone.
-4. **`check_corpus`** (LLM, `CorpusCheck`): do these papers actually answer
-   the question? Yes → `generate`; no → `web_search`.
-5. **`web_search`** (Tavily): adds web results; the corpus documents are
-   kept.
-6. **`generate`** (LLM): answers only from the documents, citing them, and
-   says plainly when they don't answer the question.
+1. **`contextualize`** (LLM, follow-ups only): rewrites the latest message
+   as a standalone question using the conversation, so "what benchmark did
+   *they* introduce?" becomes "what benchmark did RepoCoder introduce?". On
+   the first turn there is nothing to resolve, so no LLM call. Also resets
+   the per-turn state (the checkpointer keeps state across turns).
+2. **`router`** (LLM, structured output `RouteDecision`), on the standalone
+   question:
+   - `corpus` - research questions (methods, findings, benchmarks, papers);
+   - `web` - practical questions about a specific tool, library, product,
+     API or release, which papers don't cover;
+   - `out_of_scope` - not AI / software development.
+
+   When unsure it picks `corpus`, because that path can still fall back to
+   the web and the web path never checks the corpus.
+3. **`decline`**: out of scope → fixed message, no retrieval, no generation.
+4. **`retrieve_corpus`**: embeds the standalone question and retrieves the
+   top-k chunks from Pinecone.
+5. **`check_corpus`** (LLM, `CorpusCheck`): does the retrieved text actually
+   answer the question? Yes → `generate`; no → `web_search`.
+6. **`web_search`** (Tavily): on the web route, the only documents; on the
+   corpus fallback, added to the corpus documents.
+7. **`generate`** (LLM): answers the user's question (with the conversation)
+   only from the documents, citing them, and says plainly when they don't
+   answer it.
 
 The UI and evals read the outcome from the final state: `route`
 (`corpus` / `web` / `decline`) and `documents` (both corpus and web, in one
@@ -85,7 +98,7 @@ The UI and evals read the outcome from the final state: `route`
 |---|---|
 | `config.py` | `AgentConfig` — LLM model/temperature, retrieval `top_k`, web-search result count. Composes `EmbeddingConfig` from `ingestion/` so queries are embedded with the same model/dimension/index as the corpus. |
 | `state.py` | `AgentState` (graph state) and `Document` (one shape for corpus and web results). |
-| `schemas.py` | Structured LLM outputs: `ScopeDecision`, `CorpusCheck`. |
+| `schemas.py` | Structured LLM outputs: `RouteDecision`, `CorpusCheck`. |
 | `prompts.py` | One narrow prompt per LLM node, plus the decline message. |
 | `components.py` | `AgentComponents`: the LLM / corpus / web functions the nodes call. Injected into `build_graph()` so control flow is unit-tested with fakes (`tests/test_graph.py`). |
 | `nodes.py` | The node functions `(state, components) -> state update` and the routing functions for the conditional edges. |
@@ -113,5 +126,6 @@ RUN_ARXIV_INTEGRATION_TESTS=1 uv run pytest integration_tests/test_arxiv_integra
 RUN_INGESTION_INTEGRATION_TESTS=1 uv run pytest integration_tests/test_ingestion_pipeline.py -v
 ```
 
-The agent suite covers the three paths (corpus hit, web fallback,
-out-of-scope decline) plus a follow-up resolved from conversation history.
+The agent suite covers every path: the corpus route, the direct web route,
+the corpus → web fallback, the out-of-scope decline, and a follow-up
+resolved from conversation history.

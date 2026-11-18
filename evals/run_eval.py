@@ -73,10 +73,10 @@ def _print_summary(results) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--experiment-prefix", default="phase1-graph")
+    parser.add_argument("--experiment-prefix", default="phase2-router")
     parser.add_argument(
         "--description",
-        default="Phase 1: explicit StateGraph (scope_check -> retrieve_corpus -> check_corpus -> [web_search] -> generate), same policy as the Phase 0 ReAct agent.",
+        default="Phase 2: contextualize -> router (corpus | web | out_of_scope) -> [retrieve_corpus -> check_corpus] -> [web_search] -> generate.",
     )
     parser.add_argument("--grader-model", default="gpt-5", help="LLM judge model (should differ from / be stronger than the agent's)")
     parser.add_argument("--split", action="append", help="only run this category (repeatable)")

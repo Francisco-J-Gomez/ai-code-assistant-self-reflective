@@ -208,7 +208,7 @@ if question:
                 config={"configurable": {"thread_id": st.session_state.thread_id}},
             )
 
-        # documents/route are per-turn graph state (reset by scope_check each
+        # documents/route are per-turn graph state (reset by contextualize each
         # turn), so they already describe only this answer.
         answer = result["messages"][-1].content
         sources = sources_from_documents(result["documents"])

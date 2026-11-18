@@ -1,19 +1,25 @@
-"""The agent as an explicit LangGraph StateGraph (Phase 1 of
-docs/self-reflective-plan.md). This module only wires the graph; node logic
-is in agent/nodes.py, external calls in agent/components.py.
+"""The agent as an explicit LangGraph StateGraph (docs/self-reflective-plan.md,
+Phases 1-2). This module only wires the graph; node logic is in
+agent/nodes.py, external calls in agent/components.py.
 
-    START -> scope_check --out of scope--> decline --------------> END
-                 | in scope (+ standalone search query)
-                 v
-          retrieve_corpus -> check_corpus --enough--> generate --> END
-                                 | not enough            ^
-                                 v                       |
-                            web_search ------------------+
+    START -> contextualize -> router --out_of_scope--> decline --> END
+                                |  |
+                                |  +--web (tool / library / docs)----+
+                                | corpus (research)                  |
+                                v                                    v
+                     retrieve_corpus -> check_corpus --not enough--> web_search
+                                            | enough                 |
+                                            v                        |
+                                        generate <-------------------+
+                                            |
+                                            v
+                                           END
 
-Same policy as the original create_agent ReAct loop - scope check first,
-corpus before web, web only when the corpus doesn't answer, no answering from
-general knowledge - but enforced by edges instead of by the system prompt.
-There is no loop, so every turn makes at most 3 LLM calls.
+The standalone question and the route are decided up front, each by its own
+node. Practical tool/library questions go straight to the web instead of
+through a corpus search that can only fail; research questions still check
+the corpus first and fall back to the web. No loop: at most 4 LLM calls per
+turn (contextualize only calls the LLM on follow-ups).
 """
 import asyncio
 from functools import partial
@@ -49,11 +55,12 @@ def build_graph(
         checkpointer = None
 
     builder = StateGraph(AgentState)
-    for node in (nodes.scope_check, nodes.decline, nodes.retrieve_corpus, nodes.check_corpus, nodes.web_search, nodes.generate):
+    for node in (nodes.contextualize, nodes.router, nodes.decline, nodes.retrieve_corpus, nodes.check_corpus, nodes.web_search, nodes.generate):
         builder.add_node(node.__name__, partial(node, c=c))
 
-    builder.add_edge(START, "scope_check")
-    builder.add_conditional_edges("scope_check", nodes.route_after_scope_check)
+    builder.add_edge(START, "contextualize")
+    builder.add_edge("contextualize", "router")
+    builder.add_conditional_edges("router", nodes.route_after_router)
     builder.add_edge("decline", END)
     builder.add_edge("retrieve_corpus", "check_corpus")
     builder.add_conditional_edges("check_corpus", nodes.route_after_check_corpus)
