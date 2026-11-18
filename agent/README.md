@@ -20,9 +20,10 @@ uv run streamlit run ui/chat_app.py
 ```
 
 Opens a browser tab with a chat UI. Ask anything about AI/software-dev
-research — the agent searches the corpus first, falls back to a live web
-search (still scoped to AI/software-dev topics) if the corpus has nothing
-relevant, and declines outright if the question is unrelated to either. Each
+research or tools — research questions are answered from the paper corpus
+(adding a live web search if the papers don't answer them), practical
+tool/library questions go straight to web search, and anything unrelated is
+declined. Each
 answer has a collapsible "Sources" list, deduplicated by URL and labeled by
 whether it came from the paper corpus or the web. The **New Chat** button
 starts a fresh conversation thread.
