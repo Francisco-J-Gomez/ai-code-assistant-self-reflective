@@ -100,10 +100,12 @@ the actual chat UI.
   itself) and fixed it the same way. Also deduped the Sources list by
   URL — the agent sometimes calls `search_papers` twice in one turn
   (e.g. a refined retry), which surfaced the same paper twice.
-- `LANGSMITH_*` vars are in `.env` but tracing isn't wired into any code
-  yet — should already auto-instrument once these are set (no code change
-  expected), but not yet verified that traces actually show up in the
-  LangSmith UI.
+- **LangSmith tracing verified (2026-11-17)** — auto-instruments from the
+  `LANGSMITH_*` env vars, no code change needed. Traces show the LLM call →
+  `search_papers` → final answer. It hadn't worked before because
+  `LANGSMITH_ENDPOINT` pointed at a mistyped EU host (`…langchain.co`), and
+  the API key is a **US-region** key anyway (EU endpoint returns 403). It
+  must be `https://api.smith.langchain.com`.
 - Conversation memory is `InMemorySaver` — process-local, lost whenever
   the Streamlit server restarts. Fine for local single-user use; durable
   storage is a later concern if this ever needs to survive restarts or
