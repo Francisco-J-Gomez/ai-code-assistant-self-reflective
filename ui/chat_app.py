@@ -30,8 +30,8 @@ except Exception:
     pass
 
 from agent.config import AgentConfig
-from agent.graph import build_agent
-from agent.results import classify_answer_source, extract_sources
+from agent.graph import build_graph
+from agent.results import answer_badge, sources_from_documents
 
 st.set_page_config(page_title="AI / Software-Dev Research Assistant", page_icon="📄")
 
@@ -151,24 +151,17 @@ st.caption(
 )
 
 if "agent" not in st.session_state:
-    st.session_state.agent = build_agent(AgentConfig())
+    st.session_state.agent = build_graph(AgentConfig())
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 if "history" not in st.session_state:
     st.session_state.history = []  # [{"role", "content", "sources"}]
-if "message_count" not in st.session_state:
-    # Tracks how many messages the agent's checkpointed state held after the
-    # last turn, so a new turn's tool-call results can be isolated from the
-    # full accumulated thread history (result["messages"] is cumulative,
-    # not just this turn's delta).
-    st.session_state.message_count = 0
 
 
 def _start_new_chat() -> None:
     # New thread_id is enough to give the checkpointer a blank slate for
-    # this conversation - no need to rebuild the agent/LLM connection.
+    # this conversation - no need to rebuild the graph/LLM connection.
     st.session_state.history = []
-    st.session_state.message_count = 0
     st.session_state.thread_id = str(uuid.uuid4())
 
 
@@ -215,12 +208,11 @@ if question:
                 config={"configurable": {"thread_id": st.session_state.thread_id}},
             )
 
-        new_messages = result["messages"][st.session_state.message_count :]
-        st.session_state.message_count = len(result["messages"])
-
+        # documents/route are per-turn graph state (reset by scope_check each
+        # turn), so they already describe only this answer.
         answer = result["messages"][-1].content
-        sources = extract_sources(new_messages)
-        badge = classify_answer_source(new_messages)
+        sources = sources_from_documents(result["documents"])
+        badge = answer_badge(result["route"])
 
         _render_badge(badge)
         st.markdown(answer)

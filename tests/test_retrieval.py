@@ -1,6 +1,6 @@
-import agent.retrieval_tool as retrieval_tool_module
+import agent.retrieval as retrieval_module
 from agent.config import AgentConfig
-from agent.retrieval_tool import make_search_papers_tool
+from agent.retrieval import make_search_papers_tool
 
 
 class _FakeEmbedder:
@@ -25,8 +25,8 @@ class _FakePineconeStore:
 
 
 def _patch(monkeypatch):
-    monkeypatch.setattr(retrieval_tool_module, "Embedder", _FakeEmbedder)
-    monkeypatch.setattr(retrieval_tool_module, "PineconeStore", _FakePineconeStore)
+    monkeypatch.setattr(retrieval_module, "Embedder", _FakeEmbedder)
+    monkeypatch.setattr(retrieval_module, "PineconeStore", _FakePineconeStore)
 
 
 def test_tool_name_and_description(monkeypatch):
@@ -53,8 +53,8 @@ def test_tool_returns_pinecone_results_unmodified(monkeypatch):
         captured["store"] = s
         return s
 
-    monkeypatch.setattr(retrieval_tool_module, "Embedder", embedder_factory)
-    monkeypatch.setattr(retrieval_tool_module, "PineconeStore", store_factory)
+    monkeypatch.setattr(retrieval_module, "Embedder", embedder_factory)
+    monkeypatch.setattr(retrieval_module, "PineconeStore", store_factory)
 
     config = AgentConfig(retrieval_top_k=7)
     tool = make_search_papers_tool(config)

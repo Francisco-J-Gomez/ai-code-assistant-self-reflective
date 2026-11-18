@@ -1,72 +1,69 @@
-import asyncio
+"""The agent as an explicit LangGraph StateGraph (Phase 1 of
+docs/self-reflective-plan.md). This module only wires the graph; node logic
+is in agent/nodes.py, external calls in agent/components.py.
 
-from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI
-from langchain_tavily import TavilySearch
-from langgraph.checkpoint.memory import InMemorySaver
+    START -> scope_check --out of scope--> decline --------------> END
+                 | in scope (+ standalone search query)
+                 v
+          retrieve_corpus -> check_corpus --enough--> generate --> END
+                                 | not enough            ^
+                                 v                       |
+                            web_search ------------------+
 
-from agent.config import AgentConfig
-from agent.retrieval_tool import make_search_papers_tool
-
-SYSTEM_PROMPT = """\
-You are a research assistant for AI and software engineering topics, \
-grounded in a curated corpus of arXiv papers. Your scope is strictly AI \
-and software-development research: methods, findings, tools, techniques, \
-results, and related technical questions.
-
-STEP 0 - Scope check, before anything else:
-Is this question about AI or software development? If NO (e.g. cooking, \
-sports, general trivia, small talk unrelated to your scope), do NOT \
-answer it and do NOT call any tool. Instead, say plainly that you're a \
-specialized research assistant for AI/software-development topics and \
-this question is outside that scope. Stop there.
-
-If YES, continue:
-1. ALWAYS call search_papers first.
-2. If search_papers returns results that actually answer the question, \
-answer from them and cite each paper you used as "Title (arxiv_id)" with \
-its source_url as a link. State that the answer is grounded in the paper \
-corpus.
-3. If search_papers returns nothing that actually answers the question, \
-call web_search. Answer from the web results, cite each as "Title" with \
-its url, and make clear the answer comes from a live web search, not the \
-curated corpus.
-4. If neither tool turns up anything relevant, say so plainly rather \
-than guessing or answering from general knowledge.
-
-Never skip the Step 0 scope check. Never skip search_papers for an \
-in-scope question. Never call web_search before search_papers. Never \
-answer an in-scope question purely from your own general knowledge \
-without searching first.
+Same policy as the original create_agent ReAct loop - scope check first,
+corpus before web, web only when the corpus doesn't answer, no answering from
+general knowledge - but enforced by edges instead of by the system prompt.
+There is no loop, so every turn makes at most 3 LLM calls.
 """
+import asyncio
+from functools import partial
+
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+
+from agent import nodes
+from agent.components import AgentComponents, make_components
+from agent.config import AgentConfig
+from agent.state import AgentState
 
 
-def build_agent(config: AgentConfig | None = None, *, checkpointer=None):
-    """Compile the retrieval agent: search_papers (corpus) -> web_search
-    (Tavily fallback) -> honest "nothing found" as a last resort.
+def build_graph(
+    config: AgentConfig | None = None,
+    *,
+    components: AgentComponents | None = None,
+    checkpointer=None,
+):
+    """Compile the agent graph.
 
-    Defaults to InMemorySaver(): per-thread_id conversation memory,
-    process-local only (lost on restart) - fine for a single-user local
-    chat session (docs/agent-plan.md step 3). Pass checkpointer=False to
-    compile without one (LangGraph Studio / `langgraph dev` supplies its own
-    persistence - see studio_graph below).
+    components: the LLM / search functions the nodes call; defaults to the
+        real ones built from `config`. Tests inject fakes.
+    checkpointer: defaults to InMemorySaver() (per-thread_id conversation
+        memory, process-local). Pass False to compile without one - the
+        LangGraph server (`langgraph dev`) supplies its own persistence.
     """
     config = config or AgentConfig()
+    c = components or make_components(config)
     if checkpointer is None:
         checkpointer = InMemorySaver()
     elif checkpointer is False:
         checkpointer = None
 
-    llm = ChatOpenAI(model=config.llm_model, temperature=config.llm_temperature)
-    search_papers = make_search_papers_tool(config)
-    web_search = TavilySearch(max_results=config.web_search_max_results)
+    builder = StateGraph(AgentState)
+    for node in (nodes.scope_check, nodes.decline, nodes.retrieve_corpus, nodes.check_corpus, nodes.web_search, nodes.generate):
+        builder.add_node(node.__name__, partial(node, c=c))
 
-    return create_agent(
-        model=llm,
-        tools=[search_papers, web_search],
-        system_prompt=SYSTEM_PROMPT,
-        checkpointer=checkpointer,
-    )
+    builder.add_edge(START, "scope_check")
+    builder.add_conditional_edges("scope_check", nodes.route_after_scope_check)
+    builder.add_edge("decline", END)
+    builder.add_edge("retrieve_corpus", "check_corpus")
+    builder.add_conditional_edges("check_corpus", nodes.route_after_check_corpus)
+    builder.add_edge("web_search", "generate")
+    builder.add_edge("generate", END)
+
+    return builder.compile(checkpointer=checkpointer)
+
+
+_studio_graph = None
 
 
 async def studio_graph():
@@ -74,8 +71,12 @@ async def studio_graph():
     factory so the CLI doesn't pass its RunnableConfig in as AgentConfig,
     and no checkpointer because the LangGraph server manages persistence.
 
-    Async + to_thread because building the agent does blocking network I/O
-    (PineconeStore.__init__ checks/connects to the index), which the
-    LangGraph server rejects when done on its event loop.
+    Async + to_thread because building the components does blocking network
+    I/O (Pinecone connects to the index), which the LangGraph server rejects
+    when done on its event loop. Built once and cached: the server calls the
+    factory on every request, and rebuilding took 0.6-1.7 s each time.
     """
-    return await asyncio.to_thread(build_agent, checkpointer=False)
+    global _studio_graph
+    if _studio_graph is None:
+        _studio_graph = await asyncio.to_thread(build_graph, checkpointer=False)
+    return _studio_graph

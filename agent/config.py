@@ -7,7 +7,7 @@ from ingestion.config import EmbeddingConfig
 class AgentConfig:
     """Knobs for the retrieval agent. Secrets (OPENAI_API_KEY,
     PINECONE_API_KEY, TAVILY_API_KEY) are read from the environment at the
-    point of use, not stored here - see agent/retrieval_tool.py and
+    point of use, not stored here - see agent/retrieval.py and
     agent/graph.py.
     """
 

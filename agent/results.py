@@ -1,59 +1,35 @@
-import json
+"""Turn the graph's final state into what the UI shows: a deduplicated
+sources list and a corpus / web / not-grounded badge.
+
+Reads `documents` and `route` from the state. (Before Phase 1 these were
+parsed out of search_papers / tavily_search ToolMessages; retrieval is a
+graph node now, so those messages no longer exist.)
+"""
+from agent.state import Document
 
 
-def extract_sources(new_messages: list) -> list[dict]:
-    """Collect citations from this turn's tool results, de-duplicated by URL.
-
-    `new_messages` is the slice of the agent's messages added during the
-    current turn (the full thread history is cumulative). De-duplicating by
-    url matters in practice: the agent sometimes calls search_papers more
-    than once per turn (e.g. retrying with a refined query), which can
-    surface the same paper twice.
-    """
+def sources_from_documents(documents: list[Document]) -> list[dict]:
+    """Citations for this turn, de-duplicated by URL (several chunks of the
+    same paper can be retrieved)."""
     sources = []
-    for message in new_messages:
-        if getattr(message, "type", None) != "tool":
-            continue
-        try:
-            payload = json.loads(message.content)
-        except (TypeError, ValueError):
-            continue
-
-        if message.name == "search_papers":
-            for item in payload:
-                sources.append(
-                    {
-                        "kind": "corpus",
-                        "title": item.get("title"),
-                        "url": item.get("source_url"),
-                        "arxiv_id": item.get("arxiv_id"),
-                    }
-                )
-        elif message.name == "tavily_search":
-            for item in payload.get("results", []):
-                sources.append({"kind": "web", "title": item.get("title"), "url": item.get("url")})
-
     seen_urls = set()
-    deduped = []
-    for source in sources:
-        if source["url"] in seen_urls:
+    for doc in documents:
+        if doc.url in seen_urls:
             continue
-        seen_urls.add(source["url"])
-        deduped.append(source)
-    return deduped
+        seen_urls.add(doc.url)
+        source = {"kind": doc.kind, "title": doc.title, "url": doc.url}
+        if doc.kind == "corpus":
+            source["arxiv_id"] = doc.arxiv_id
+        sources.append(source)
+    return sources
 
 
-def classify_answer_source(new_messages: list) -> dict:
-    """Which tool actually fired this turn, not what the answer's prose
-    claims - search_papers always returns its top-k regardless of whether
-    the results are actually relevant, so "was a tool called" is the
-    reliable signal, not "did it return something non-empty". If
-    web_search fired at all, the agent judged the corpus insufficient and
-    escalated, regardless of what search_papers happened to return.
-    """
-    tool_names = {getattr(m, "name", None) for m in new_messages if getattr(m, "type", None) == "tool"}
-    if "tavily_search" in tool_names:
+def answer_badge(route: str | None) -> dict:
+    """Which path the graph actually took this turn (not what the answer's
+    prose claims): "web" means the corpus was judged insufficient and the
+    answer includes a live web search."""
+    if route == "web":
         return {"icon": "🌐", "label": "Includes live web search", "kind": "web"}
-    if "search_papers" in tool_names:
+    if route == "corpus":
         return {"icon": "📄", "label": "Grounded in the paper corpus", "kind": "corpus"}
     return {"icon": "❌", "label": "Not grounded — no relevant source found", "kind": "none"}
