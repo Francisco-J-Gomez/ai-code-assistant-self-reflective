@@ -85,3 +85,36 @@ and latency: the means are dominated by a single runaway loop.
 - **Route for false-premise questions.** Web is accepted for `halluc-02/03`
   (checking a premise online is reasonable) but not yet for `halluc-04`;
   changing it would invalidate this baseline, so it's left as is.
+
+## Phase 1 — `phase1-graph-d325de4c` (2026-11-18)
+
+Agent: explicit `StateGraph` (`scope_check → retrieve_corpus → check_corpus
+→ [web_search] → generate`), no loop, one corpus search per turn,
+`gpt-5-mini`, top_k=5. Same grader and dataset as the baseline.
+
+| category | route | retr. hit | recall | correct | grounded | LLM calls | k-tokens | latency (s) |
+|---|---|---|---|---|---|---|---|---|
+| corpus | 0.90 | 1.00 | 0.49 | 0.85 | 0.60 | 3.0 | 6.8 | 57.7 |
+| follow_up | 1.00 | 1.00 | 0.87 | 0.92 | 0.60 | 2.7 | 4.9 | 59.7 |
+| hallucination_trap | 0.67 | 0.50 | 0.30 | 0.92 | 1.00 | 3.0 | 6.3 | 25.3 |
+| multi_part | 0.83 | 1.00 | 0.51 | 0.83 | 0.50 | 3.0 | 6.8 | 74.3 |
+| out_of_scope | 1.00 | – | – | 1.00 | – | 1.0 | 0.4 | 1.9 |
+| web | 0.83 | – | – | 0.83 | 0.67 | 3.0 | 6.4 | 69.4 |
+| **ALL** | **0.88** | **0.92** | **0.54** | **0.89** | **0.67** | 2.65 | 5.4 | 49.0 |
+
+**Per question (median):** 28.6 s latency. Mean latency is inflated by two
+OpenAI stalls (`check_corpus` 254 s, `generate` 258 s, one of them in
+`corpus-06`). Per node (median): scope_check 3.3 s, retrieve_corpus 0.6 s,
+check_corpus 5.5 s, web_search 2.7 s, generate 17.8 s.
+
+### What changed vs. the baseline
+
+| | Result | Why |
+|---|---|---|
+| **Cost** | Mean tokens 150k → 5.4k per question; hallucination traps 924k → 6.3k; max 3 LLM calls | No loop: the `halluc-05` runaway (60 calls, 3.8M tokens) is impossible by construction |
+| **Quality** | Correctness 0.90 → 0.89 (unchanged); groundedness 0.55 → 0.67; hallucination-trap correctness 0.75 → 0.92 | Narrow generate prompt (documents only, point out false premises, no process narration); no "Scope check" leak |
+| **Recall** | 0.72 → 0.54 (corpus 0.60 → 0.49, multi_part 0.70 → 0.51, `multi-03` 0.14) | One search with the rewritten query; the ReAct agent often searched several times. Multi-part questions need one query per part → Phase 3/5 (`rewrite_query`, sub-queries) |
+| **Route** | 0.93 → 0.88. `corpus-01`, `multi-04`, `halluc-04`, `halluc-05` went to web (answers still correct: generate sees the corpus papers too); `web-06` still went to corpus | `check_corpus` is one yes/no judgement over 5 abstracts — noisy in both directions. `web-06` without "interrupt()" in the question still matches the LangGraph paper's abstract. → Phase 3 (`grade_docs`, per-document relevance) |
+
+Conclusion: the refactor met its goal (same answer quality, bounded cost);
+the remaining gaps are the ones Phase 3 targets.

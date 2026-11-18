@@ -20,10 +20,10 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from langsmith import Client, evaluate  # noqa: E402
 
 from agent.config import AgentConfig  # noqa: E402
-from agent.graph import build_agent  # noqa: E402
+from agent.graph import build_graph  # noqa: E402
 from evals.dataset_io import DATASET_NAME  # noqa: E402
 from evals.evaluators import CODE_EVALUATORS, make_llm_judges  # noqa: E402
-from evals.targets import make_react_agent_target  # noqa: E402
+from evals.targets import make_graph_target  # noqa: E402
 
 SUMMARY_KEYS = ["route_correct", "retrieval_hit", "retrieval_recall", "correctness", "groundedness", "llm_calls", "ktokens"]
 
@@ -73,7 +73,11 @@ def _print_summary(results) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--experiment-prefix", default="phase0-baseline")
+    parser.add_argument("--experiment-prefix", default="phase1-graph")
+    parser.add_argument(
+        "--description",
+        default="Phase 1: explicit StateGraph (scope_check -> retrieve_corpus -> check_corpus -> [web_search] -> generate), same policy as the Phase 0 ReAct agent.",
+    )
     parser.add_argument("--grader-model", default="gpt-5", help="LLM judge model (should differ from / be stronger than the agent's)")
     parser.add_argument("--split", action="append", help="only run this category (repeatable)")
     parser.add_argument("--limit", type=int, help="only run the first N examples (smoke test)")
@@ -86,11 +90,11 @@ def main() -> None:
     print(f"Running {len(data)} example(s) from {DATASET_NAME!r} (agent={agent_config.llm_model}, grader={args.grader_model})")
 
     results = evaluate(
-        make_react_agent_target(build_agent(agent_config)),
+        make_graph_target(build_graph(agent_config)),
         data=data,
         evaluators=[*CODE_EVALUATORS, *make_llm_judges(args.grader_model)],
         experiment_prefix=args.experiment_prefix,
-        description="Phase 0 baseline: create_agent ReAct loop with prompt-enforced scope check and web fallback.",
+        description=args.description,
         metadata={
             "phase": args.experiment_prefix,
             "git_sha": _git_sha(),

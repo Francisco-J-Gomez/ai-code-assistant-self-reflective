@@ -64,7 +64,7 @@ first. Not blocking current progress — revisit when relevant.
 
 ## Agent / serving side (MVP done, see docs/agent-plan.md)
 
-Built: `agent/config.py` (`AgentConfig`), `agent/retrieval_tool.py`
+Built: `agent/config.py` (`AgentConfig`), `agent/retrieval.py`
 (`search_papers`), `agent/graph.py` (the agent itself — both tools, system
 prompt, `InMemorySaver` checkpointer), `ui/chat_app.py` (Streamlit chat).
 Verified end-to-end against real OpenAI + Pinecone + Tavily across all

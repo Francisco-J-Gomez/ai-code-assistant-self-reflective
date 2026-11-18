@@ -1,56 +1,79 @@
-import json
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, LLMResult
 
-from langchain_core.messages import AIMessage, ToolMessage
-
+from agent.state import Document
 from evals.evaluators import NOT_APPLICABLE, cost_signals, retrieval_hit, retrieval_recall, route_correct
-from evals.targets import summarize_turn
+from evals.targets import UsageCounter, make_graph_target, outputs_from_state
+
+PAPER_A = Document(kind="corpus", title="TA", url="https://arxiv.org/abs/a", text="abstract a", arxiv_id="a")
+PAPER_A_CHUNK2 = PAPER_A.model_copy(update={"text": "abstract a, chunk 2"})
+PAPER_B = Document(kind="corpus", title="TB", url="https://arxiv.org/abs/b", text="abstract b", arxiv_id="b")
+WEB = Document(kind="web", title="W", url="https://example.com", text="web text")
 
 
-def _papers(*ids):
-    return ToolMessage(
-        name="search_papers",
-        tool_call_id="1",
-        content=json.dumps([
-            {"arxiv_id": i, "title": f"T{i}", "source_url": f"https://arxiv.org/abs/{i}", "text": f"abstract {i}"}
-            for i in ids
-        ]),
-    )
+def _usage(calls=2, inp=20, out=10):
+    u = UsageCounter()
+    u.llm_calls, u.input_tokens, u.output_tokens = calls, inp, out
+    return u
 
 
-def _web():
-    return ToolMessage(
-        name="tavily_search",
-        tool_call_id="2",
-        content=json.dumps({"results": [{"title": "W", "url": "https://example.com", "content": "web text"}]}),
-    )
+def _state(route, documents, answer="answer"):
+    return {"messages": [HumanMessage("q"), AIMessage(answer)], "route": route, "documents": documents}
 
 
-def _ai(text, tokens=(10, 5)):
-    return AIMessage(content=text, usage_metadata={"input_tokens": tokens[0], "output_tokens": tokens[1], "total_tokens": sum(tokens)})
-
-
-def test_summarize_corpus_turn():
-    out = summarize_turn([_ai(""), _papers("a", "b"), _ai("answer")])
+def test_outputs_corpus_turn():
+    out = outputs_from_state(_state("corpus", [PAPER_A, PAPER_A_CHUNK2, PAPER_B]), _usage())
     assert out["route"] == "corpus"
     assert out["answer"] == "answer"
-    assert out["retrieved_ids"] == ["a", "b"]
-    assert "abstract a" in out["context"]
-    assert out["llm_calls"] == 2
-    assert (out["input_tokens"], out["output_tokens"]) == (20, 10)
+    assert out["retrieved_ids"] == ["a", "b"]  # de-duplicated, in order
+    assert "[a] TA\nabstract a" in out["context"]
+    assert (out["llm_calls"], out["input_tokens"], out["output_tokens"]) == (2, 20, 10)
 
 
-def test_summarize_web_turn_wins_over_corpus():
-    out = summarize_turn([_ai(""), _papers("a"), _ai(""), _web(), _ai("answer")])
+def test_outputs_web_turn_keeps_corpus_ids_and_web_context():
+    out = outputs_from_state(_state("web", [PAPER_A, WEB]), _usage())
     assert out["route"] == "web"
-    assert out["tools_used"] == ["search_papers", "tavily_search"]
-    assert "web text" in out["context"]
+    assert out["retrieved_ids"] == ["a"]
+    assert "[https://example.com] W\nweb text" in out["context"]
 
 
-def test_summarize_no_tool_is_decline():
-    out = summarize_turn([_ai("out of scope")])
+def test_outputs_decline_turn():
+    out = outputs_from_state(_state("decline", []), _usage(calls=1))
     assert out["route"] == "decline"
     assert out["retrieved_ids"] == []
     assert out["context"] == ""
+
+
+def _llm_result(inp, out):
+    msg = AIMessage("x", usage_metadata={"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out})
+    return LLMResult(generations=[[ChatGeneration(message=msg)]])
+
+
+def test_usage_counter_sums_calls_and_tokens():
+    u = UsageCounter()
+    u.on_llm_end(_llm_result(10, 5))
+    u.on_llm_end(_llm_result(7, 3))
+    assert (u.llm_calls, u.input_tokens, u.output_tokens) == (2, 17, 8)
+
+
+def test_graph_target_replays_history_and_passes_callbacks():
+    captured = {}
+
+    class FakeGraph:
+        def invoke(self, inputs, config):
+            captured["inputs"], captured["config"] = inputs, config
+            return _state("corpus", [PAPER_A])
+
+    target = make_graph_target(FakeGraph())
+    out = target({"question": "follow-up?", "chat_history": [{"role": "user", "content": "first"}]})
+
+    assert captured["inputs"]["messages"] == [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "follow-up?"},
+    ]
+    assert captured["config"]["configurable"]["thread_id"].startswith("eval-")
+    assert isinstance(captured["config"]["callbacks"][0], UsageCounter)
+    assert out["retrieved_ids"] == ["a"]
 
 
 def _outputs(**kw):

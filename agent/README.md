@@ -1,6 +1,6 @@
 # Agent and chat UI (online)
 
-The serving side of the project: a tool-calling LangGraph agent that answers
+The serving side of the project: a LangGraph `StateGraph` agent that answers
 AI / software-development questions from the arXiv corpus, falling back to web
 search, plus the Streamlit chat app on top of it.
 
@@ -29,55 +29,69 @@ starts a fresh conversation thread.
 
 ## How the agent works
 
-The actual compiled LangGraph structure (`agent.get_graph().draw_mermaid()` —
-not hand-drawn, this is what `create_agent(...)` in `graph.py` really builds):
+An explicit LangGraph `StateGraph` (`graph.py`). The actual compiled
+structure (`graph.get_graph().draw_mermaid()`, not hand-drawn):
 
 ```mermaid
 graph TD;
 	__start__([<p>__start__</p>]):::first
-	model(model)
-	tools(tools)
+	scope_check(scope_check)
+	decline(decline)
+	retrieve_corpus(retrieve_corpus)
+	check_corpus(check_corpus)
+	web_search(web_search)
+	generate(generate)
 	__end__([<p>__end__</p>]):::last
-	__start__ --> model;
-	model -.-> __end__;
-	model -.-> tools;
-	tools -.-> model;
+	__start__ --> scope_check;
+	check_corpus -.-> generate;
+	check_corpus -.-> web_search;
+	retrieve_corpus --> check_corpus;
+	scope_check -.-> decline;
+	scope_check -.-> retrieve_corpus;
+	web_search --> generate;
+	decline --> __end__;
+	generate --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
 ```
 
-`model` is the OpenAI LLM deciding what to do next; `tools` is a single node
-bundling both tools. The graph just loops model ↔ tools until the model stops
-requesting tool calls. Which tool is called, in what order, and when to give
-up are **prompt-level behavior** (`SYSTEM_PROMPT` in `graph.py`), not enforced
-by the graph's edges.
+Control flow is enforced by the graph's edges, not by a system prompt the
+LLM may or may not follow. There is no loop: a turn makes at most 3 LLM
+calls (scope check, corpus check, generation).
 
-1. The user submits a question in the Streamlit chat UI.
-2. **Step 0, scope check:** if the question isn't about AI or software
-   development, the agent declines without calling any tool. (An early prompt
-   version let it answer a cookie-recipe question from general knowledge; the
-   explicit Step 0 plus a regression test fixed that.)
-3. **`search_papers`:** embeds the query and retrieves the top-k chunks from
-   Pinecone.
-   - Relevant results → answer grounded in the chunks, citing paper title +
-     link.
-   - Nothing relevant → fall back to `web_search`.
-4. **`web_search`** (Tavily): answers from web results, clearly marked as
-   web-sourced rather than from the curated corpus. If nothing relevant turns
-   up either, the agent says so rather than hallucinating.
-5. The answer and its sources (labeled by tool) go back to the user.
+1. **`scope_check`** (LLM, structured output `ScopeDecision`): is the latest
+   message about AI / software development? Also rewrites it as a
+   self-contained search query using the conversation, so follow-ups ("what
+   benchmark did *they* introduce?") retrieve the right papers. Resets the
+   per-turn state (the checkpointer keeps state across turns).
+2. **`decline`**: out of scope → fixed message, no retrieval, no generation.
+3. **`retrieve_corpus`**: embeds the search query and retrieves the top-k
+   chunks from Pinecone.
+4. **`check_corpus`** (LLM, `CorpusCheck`): do these papers actually answer
+   the question? Yes → `generate`; no → `web_search`.
+5. **`web_search`** (Tavily): adds web results; the corpus documents are
+   kept.
+6. **`generate`** (LLM): answers only from the documents, citing them, and
+   says plainly when they don't answer the question.
 
-Query rewriting and multi-hop retrieval can be layered on later.
+The UI and evals read the outcome from the final state: `route`
+(`corpus` / `web` / `decline`) and `documents` (both corpus and web, in one
+`Document` shape).
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `config.py` | `AgentConfig` — LLM model/temperature, retrieval `top_k`, web-search result count. Composes `EmbeddingConfig` from `ingestion/` so queries are embedded with the same model/dimension/index as the corpus. |
-| `retrieval_tool.py` | The `search_papers` tool (Pinecone query). |
-| `graph.py` | `build_agent()`: both tools, the system prompt, and an `InMemorySaver` checkpointer for per-thread conversation memory. |
-| `results.py` | `extract_sources()` (deduplicated citations from a turn's tool results) and `classify_answer_source()` (corpus / web / not-grounded badge). Used by the UI; unit-tested. |
+| `state.py` | `AgentState` (graph state) and `Document` (one shape for corpus and web results). |
+| `schemas.py` | Structured LLM outputs: `ScopeDecision`, `CorpusCheck`. |
+| `prompts.py` | One narrow prompt per LLM node, plus the decline message. |
+| `components.py` | `AgentComponents`: the LLM / corpus / web functions the nodes call. Injected into `build_graph()` so control flow is unit-tested with fakes (`tests/test_graph.py`). |
+| `nodes.py` | The node functions `(state, components) -> state update` and the routing functions for the conditional edges. |
+| `graph.py` | Wiring only: `build_graph()` (nodes, edges, `InMemorySaver` checkpointer) and `studio_graph()` for `langgraph dev`. |
+| `retrieval.py` | `make_corpus_search()` (Pinecone query used by `retrieve_corpus`) and the `search_papers` tool wrapping it for tool-calling agents. |
+| `results.py` | `sources_from_documents()` (deduplicated citations) and `answer_badge()` (corpus / web / not-grounded badge) from the final state. Used by the UI; unit-tested. |
 | `../ui/chat_app.py` | Streamlit chat interface: session state, rendering, styling. |
 
 Conversation memory is process-local (lost when the Streamlit server
@@ -99,5 +113,5 @@ RUN_ARXIV_INTEGRATION_TESTS=1 uv run pytest integration_tests/test_arxiv_integra
 RUN_INGESTION_INTEGRATION_TESTS=1 uv run pytest integration_tests/test_ingestion_pipeline.py -v
 ```
 
-The agent suite covers the three paths: corpus hit, web fallback, and
-out-of-scope decline.
+The agent suite covers the three paths (corpus hit, web fallback,
+out-of-scope decline) plus a follow-up resolved from conversation history.
