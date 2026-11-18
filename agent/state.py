@@ -30,10 +30,12 @@ class AgentState(BaseModel):
     # Conversation history, persisted per thread by the checkpointer.
     messages: Annotated[list[AnyMessage], add_messages] = Field(default_factory=list)
 
-    # Per-turn fields. scope_check resets them at the start of every turn:
+    # Per-turn fields. contextualize resets them at the start of every turn:
     # the checkpointer carries state across turns, and an out-of-scope
     # follow-up must not show the previous turn's documents.
-    question: str = ""
-    search_query: str = ""
+    question: str = ""  # the latest user message, as typed
+    standalone_question: str = ""  # same question, understandable without the conversation
+    # The path taken so far: set by router, overwritten by check_corpus when
+    # the corpus turns out not to be enough.
     route: Route | None = None
     documents: list[Document] = Field(default_factory=list)

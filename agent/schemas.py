@@ -3,16 +3,19 @@
 state: a node reads one of these and writes the relevant fields to
 AgentState. Later phases add theirs here (e.g. DocGrade, Critique).
 """
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
-class ScopeDecision(BaseModel):
-    """Output of scope_check."""
+class RouteDecision(BaseModel):
+    """Output of router."""
 
-    in_scope: bool = Field(description="True if the latest message is about AI or software development.")
-    search_query: str = Field(
-        description="The latest message rewritten as a self-contained search query, resolving references "
-        "to the conversation (e.g. 'it', 'the first one'). Empty if out of scope."
+    reasoning: str = Field(description="One sentence on what kind of question this is, written before the route.")
+    route: Literal["corpus", "web", "out_of_scope"] = Field(
+        description="corpus: research questions (papers, methods, findings, results). "
+        "web: practical questions about specific tools, libraries, products, docs, versions or releases. "
+        "out_of_scope: not about AI or software development."
     )
 
 

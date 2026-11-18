@@ -5,7 +5,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from agent import nodes
 from agent.prompts import DECLINE_MESSAGE
-from agent.schemas import CorpusCheck, ScopeDecision
+from agent.schemas import CorpusCheck, RouteDecision
 from agent.state import AgentState, Document
 
 PAPER = Document(kind="corpus", title="P", url="https://arxiv.org/abs/1", text="...", arxiv_id="1")
@@ -31,16 +31,37 @@ def test_split_latest_question_without_user_message_raises():
         nodes.split_latest_question([AIMessage("hi")])
 
 
-def test_scope_check_resets_per_turn_fields():
+def test_contextualize_first_turn_skips_the_llm_and_resets_per_turn_fields():
+    def fail(q, h):
+        raise AssertionError("no history: contextualize must not call the LLM")
+
     state = AgentState(messages=[HumanMessage("q")], route="web", documents=[PAPER])
-    c = Stub(scope_check=lambda q, h: ScopeDecision(in_scope=True, search_query="sq"))
-    assert nodes.scope_check(state, c) == {"question": "q", "search_query": "sq", "route": None, "documents": []}
+    assert nodes.contextualize(state, Stub(contextualize=fail)) == {
+        "question": "q",
+        "standalone_question": "q",
+        "route": None,
+        "documents": [],
+    }
 
 
-def test_scope_check_out_of_scope_sets_decline_route():
-    c = Stub(scope_check=lambda q, h: ScopeDecision(in_scope=False, search_query=""))
-    update = nodes.scope_check(AgentState(messages=[HumanMessage("cookies?")]), c)
-    assert update["route"] == "decline"
+def test_contextualize_follow_up_rewrites_with_history():
+    seen = {}
+
+    def contextualize(q, h):
+        seen["history"] = [m.content for m in h]
+        return "What benchmark did RepoCoder introduce?"
+
+    state = AgentState(messages=[HumanMessage("What is RepoCoder?"), AIMessage("A paper."), HumanMessage("What benchmark did they introduce?")])
+    update = nodes.contextualize(state, Stub(contextualize=contextualize))
+    assert update["question"] == "What benchmark did they introduce?"
+    assert update["standalone_question"] == "What benchmark did RepoCoder introduce?"
+    assert seen["history"] == ["What is RepoCoder?", "A paper."]
+
+
+@pytest.mark.parametrize("decision, route", [("corpus", "corpus"), ("web", "web"), ("out_of_scope", "decline")])
+def test_router_maps_decision_to_route(decision, route):
+    c = Stub(route=lambda q: RouteDecision(reasoning="", route=decision))
+    assert nodes.router(AgentState(standalone_question="q"), c) == {"route": route}
 
 
 def test_decline_returns_fixed_message():
@@ -49,22 +70,36 @@ def test_decline_returns_fixed_message():
 
 
 @pytest.mark.parametrize("enough, route", [(True, "corpus"), (False, "web")])
-def test_check_corpus_sets_route(enough, route):
-    c = Stub(check_corpus=lambda q, d: CorpusCheck(reasoning="", answers_question=enough))
-    assert nodes.check_corpus(AgentState(question="q", documents=[PAPER]), c) == {"route": route}
+def test_check_corpus_sets_route_judging_the_standalone_question(enough, route):
+    seen = []
+    c = Stub(check_corpus=lambda q, d: seen.append(q) or CorpusCheck(reasoning="", answers_question=enough))
+    state = AgentState(question="they?", standalone_question="RepoCoder?", documents=[PAPER])
+    assert nodes.check_corpus(state, c) == {"route": route}
+    assert seen == ["RepoCoder?"]
 
 
 def test_web_search_appends_to_corpus_documents():
     c = Stub(search_web=lambda q: [WEB])
-    update = nodes.web_search(AgentState(search_query="q", documents=[PAPER]), c)
+    update = nodes.web_search(AgentState(standalone_question="q", documents=[PAPER]), c)
     assert update["documents"] == [PAPER, WEB]
 
 
 @pytest.mark.parametrize(
-    "route, after_scope, after_check",
-    [("decline", "decline", "web_search"), (None, "retrieve_corpus", "web_search"), ("corpus", "retrieve_corpus", "generate"), ("web", "retrieve_corpus", "web_search")],
+    "route, after_router",
+    [("decline", "decline"), ("web", "web_search"), ("corpus", "retrieve_corpus"), (None, "retrieve_corpus")],
 )
-def test_routing_functions(route, after_scope, after_check):
-    state = AgentState(route=route)
-    assert nodes.route_after_scope_check(state) == after_scope
-    assert nodes.route_after_check_corpus(state) == after_check
+def test_route_after_router(route, after_router):
+    assert nodes.route_after_router(AgentState(route=route)) == after_router
+
+
+@pytest.mark.parametrize("route, after_check", [("corpus", "generate"), ("web", "web_search")])
+def test_route_after_check_corpus(route, after_check):
+    assert nodes.route_after_check_corpus(AgentState(route=route)) == after_check
+
+
+def test_source_note_is_decided_by_the_documents_not_the_model():
+    from agent.prompts import CORPUS_ONLY_NOTE, WITH_WEB_NOTE, source_note
+
+    assert source_note([PAPER]) == CORPUS_ONLY_NOTE
+    assert source_note([PAPER, WEB]) == WITH_WEB_NOTE
+    assert source_note([WEB]) == WITH_WEB_NOTE

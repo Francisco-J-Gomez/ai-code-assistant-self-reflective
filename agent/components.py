@@ -13,16 +13,18 @@ from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 
 from agent.config import AgentConfig
-from agent.prompts import CHECK_CORPUS_PROMPT, GENERATE_PROMPT, SCOPE_PROMPT, format_documents
+from agent.prompts import CHECK_CORPUS_PROMPT, CONTEXTUALIZE_PROMPT, GENERATE_PROMPT, ROUTER_PROMPT, format_documents, source_note
 from agent.retrieval import make_corpus_search
-from agent.schemas import CorpusCheck, ScopeDecision
+from agent.schemas import CorpusCheck, RouteDecision
 from agent.state import Document
 
 
 @dataclass(frozen=True)
 class AgentComponents:
-    # (question, prior conversation) -> scope verdict + standalone search query
-    scope_check: Callable[[str, list[AnyMessage]], ScopeDecision]
+    # (latest question, prior conversation) -> standalone question
+    contextualize: Callable[[str, list[AnyMessage]], str]
+    # standalone question -> corpus / web / out of scope
+    route: Callable[[str], RouteDecision]
     # search query -> corpus documents
     search_corpus: Callable[[str], list[Document]]
     # (question, corpus documents) -> are they enough?
@@ -40,13 +42,16 @@ def make_components(config: AgentConfig) -> AgentComponents:
     off the event loop in async contexts - see agent.graph.studio_graph.
     """
     llm = ChatOpenAI(model=config.llm_model, temperature=config.llm_temperature)
-    scope_llm = llm.with_structured_output(ScopeDecision)
+    router_llm = llm.with_structured_output(RouteDecision)
     check_llm = llm.with_structured_output(CorpusCheck)
     corpus_search = make_corpus_search(config)
     tavily = TavilySearch(max_results=config.web_search_max_results)
 
-    def scope_check(question: str, history: list[AnyMessage]) -> ScopeDecision:
-        return scope_llm.invoke([SystemMessage(SCOPE_PROMPT), *history, HumanMessage(question)])
+    def contextualize(question: str, history: list[AnyMessage]) -> str:
+        return llm.invoke([SystemMessage(CONTEXTUALIZE_PROMPT), *history, HumanMessage(question)]).content.strip()
+
+    def route(question: str) -> RouteDecision:
+        return router_llm.invoke(ROUTER_PROMPT.format(question=question))
 
     def search_corpus(query: str) -> list[Document]:
         return [
@@ -79,12 +84,17 @@ def make_components(config: AgentConfig) -> AgentComponents:
 
     def generate(question: str, history: list[AnyMessage], documents: list[Document]) -> str:
         response = llm.invoke(
-            [SystemMessage(GENERATE_PROMPT.format(documents=format_documents(documents))), *history, HumanMessage(question)]
+            [
+                SystemMessage(GENERATE_PROMPT.format(source_note=source_note(documents), documents=format_documents(documents))),
+                *history,
+                HumanMessage(question),
+            ]
         )
         return response.content
 
     return AgentComponents(
-        scope_check=scope_check,
+        contextualize=contextualize,
+        route=route,
         search_corpus=search_corpus,
         check_corpus=check_corpus,
         search_web=search_web,

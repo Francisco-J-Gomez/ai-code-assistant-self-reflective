@@ -118,3 +118,48 @@ check_corpus 5.5 s, web_search 2.7 s, generate 17.8 s.
 
 Conclusion: the refactor met its goal (same answer quality, bounded cost);
 the remaining gaps are the ones Phase 3 targets.
+
+## Phase 2 — `phase2-router-3a51a33b` (2026-11-18)
+
+Agent: `contextualize → router (corpus | web | out_of_scope) →
+[retrieve_corpus → check_corpus] → [web_search] → generate`. Same grader and
+dataset. Final Phase 2 code, including the `generate` fixes (source label
+set by the graph, no closing offers, say plainly when a paper isn't found).
+
+| category | route | retr. hit | recall | correct | grounded | LLM calls | k-tokens | latency (s) |
+|---|---|---|---|---|---|---|---|---|
+| corpus | 1.00 | 1.00 | 0.54 | 0.75 | 0.55 | 3.0 | 6.7 | 47.2 |
+| follow_up | 1.00 | 1.00 | 0.77 | 1.00 | 0.80 | 3.7 | 5.4 | 34.4 |
+| hallucination_trap | 0.67 | 0.50 | 0.30 | 0.83 | 0.67 | 3.0 | 6.6 | 29.9 |
+| multi_part | 0.83 | 1.00 | 0.59 | 0.92 | 0.50 | 3.0 | 7.6 | 60.2 |
+| out_of_scope | 1.00 | – | – | 1.00 | – | 1.0 | 0.5 | 5.1 |
+| web | 1.00 | – | – | 0.92 | 0.92 | 2.2 | 4.0 | 32.0 |
+| **ALL** | **0.93** | **0.92** | **0.56** | **0.89** | **0.67** | 2.67 | 5.3 | 36.0 |
+
+An earlier run of Phase 2 *before* the `generate` fixes,
+`phase2-router-eb25370e`: ALL route 0.93, correctness 0.89, groundedness
+0.70, hallucination-trap correctness 0.75, corpus correctness 0.85, median
+latency 22.5 s.
+
+Between the two runs:
+
+- **Hallucination traps 0.75 → 0.83** — the targeted fix (`halluc-01` 0.5 →
+  1.0: now says plainly the paper wasn't found).
+- **Corpus correctness 0.85 → 0.75 is noise**: same retrieved papers (first-
+  turn search query = the question, Pinecone is deterministic); the judge
+  marked `corpus-02` / `corpus-06` down for omitting RepoCoder / RLCoder /
+  TIPICAL, which weren't retrieved in either run. Judge noise also shows in
+  `halluc-05`: correctness 1.0 and groundedness 0 for the same answer.
+- **Latency** up across every category, including `out_of_scope` (a single
+  router call: 2.3 → 5.1 s) → OpenAI API latency, not the code.
+
+vs. Phase 1 (`phase1-graph-d325de4c`): route 0.88 → 0.93 (every web question
+routed correctly, including `web-06`; remaining misses are `check_corpus`
+fallbacks: `multi-04`, `halluc-04`, `halluc-05`), follow-up correctness
+0.92 → 1.00, correctness 0.89 → 0.89. Details:
+[docs/phases/phase-2-router.md](../docs/phases/phase-2-router.md#results).
+
+**Evaluator caveat:** `outputs_from_state` gives the judge corpus papers as
+`[arxiv_id] title` without the URL, so cited paper URLs are flagged as
+unsupported. Affects every phase equally; fix together with a baseline
+re-run.
