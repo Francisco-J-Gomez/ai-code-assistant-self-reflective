@@ -163,3 +163,31 @@ fallbacks: `multi-04`, `halluc-04`, `halluc-05`), follow-up correctness
 `[arxiv_id] title` without the URL, so cited paper URLs are flagged as
 unsupported. Affects every phase equally; fix together with a baseline
 re-run.
+
+## Phase 3 — `phase3-crag-1c490aad` (2026-11-19)
+
+Agent: `contextualize → router → decompose → corpus_search ×N (retrieve →
+grade_docs, top 3 relevant per sub-query → rewrite once) → merge_results →
+generate | fallback_research (ReAct: web + live arXiv)`. Same grader and
+dataset. `min_relevant_docs = 1`, `max_relevant_docs = 3`,
+`max_query_rewrites = 1`, `max_sub_queries = 3`.
+
+| category | route | retr. hit | recall | correct | grounded | LLM calls | k-tokens | latency (s) |
+|---|---|---|---|---|---|---|---|---|
+| corpus | 1.00 | 1.00 | 0.45 | 0.80 | 0.55 | 4.1 | 6.9 | 51.0 |
+| follow_up | 1.00 | 1.00 | 0.83 | 0.92 | 0.70 | 4.7 | 5.9 | 41.5 |
+| hallucination_trap | 0.83 | 0.50 | 0.30 | 0.83 | 0.75 | 7.8 | 11.8 | 68.7 |
+| multi_part | 1.00 | 1.00 | 0.70 | 0.92 | 0.67 | 5.0 | 10.9 | 62.5 |
+| out_of_scope | 1.00 | – | – | 1.00 | – | 1.0 | 0.5 | 3.4 |
+| web | 1.00 | – | – | 0.83 | 0.83 | 2.0 | 3.4 | 30.0 |
+| **ALL** | **0.97** | **0.92** | **0.56** | **0.88** | **0.68** | 4.10 | 6.6 | 43.7 |
+
+**Per question (median):** 47.8 s latency.
+
+vs. Phase 2 (`phase2-router-3a51a33b`): route 0.93 → 0.97 (`multi-04`,
+`halluc-04` fixed; only `halluc-05` left), multi-part recall 0.59 → 0.70,
+correctness 0.89 → 0.88 and groundedness 0.67 → 0.68 (flat; the unchanged
+web route moved by as much), LLM calls 2.7 → 4.1. Corpus recall 0.54 →
+0.45 is `decompose` rephrasing single-part questions differently per run —
+a retrieval-only check shows no systematic loss (0.54 vs 0.53). Details:
+[docs/phases/phase-3-corrective-rag.md](../docs/phases/phase-3-corrective-rag.md#results).

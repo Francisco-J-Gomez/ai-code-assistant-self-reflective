@@ -20,10 +20,10 @@ uv run streamlit run ui/chat_app.py
 ```
 
 Opens a browser tab with a chat UI. Ask anything about AI/software-dev
-research or tools — research questions are answered from the paper corpus
-(adding a live web search if the papers don't answer them), practical
-tool/library questions go straight to web search, and anything unrelated is
-declined. Each
+research or tools — research questions are answered from the relevant papers
+in the corpus (retrying with a rewritten query, then searching the web and
+live arXiv if too few are relevant), practical tool/library questions go
+straight to web search, and anything unrelated is declined. Each
 answer has a collapsible "Sources" list, deduplicated by URL and labeled by
 whether it came from the paper corpus or the web. The **New Chat** button
 starts a fresh conversation thread.
@@ -39,30 +39,48 @@ graph TD;
 	contextualize(contextualize)
 	router(router)
 	decline(decline)
-	retrieve_corpus(retrieve_corpus)
-	check_corpus(check_corpus)
+	decompose(decompose)
+	fallback_research(fallback_research)
 	web_search(web_search)
 	generate(generate)
+	merge_results(merge_results)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> contextualize;
-	check_corpus -.-> generate;
-	check_corpus -.-> web_search;
 	contextualize --> router;
-	retrieve_corpus --> check_corpus;
+	cs_report --> merge_results;
+	decompose -.-> cs___start__;
+	fallback_research --> generate;
+	merge_results -.-> fallback_research;
+	merge_results -.-> generate;
 	router -.-> decline;
-	router -.-> retrieve_corpus;
+	router -.-> decompose;
 	router -.-> web_search;
 	web_search --> generate;
 	decline --> __end__;
 	generate --> __end__;
+	subgraph corpus_search
+	cs___start__(<p>__start__</p>)
+	cs_retrieve_corpus(retrieve_corpus)
+	cs_grade_docs(grade_docs)
+	cs_rewrite_query(rewrite_query)
+	cs_report(report)
+	cs___start__ --> cs_retrieve_corpus;
+	cs_grade_docs -.-> cs_report;
+	cs_grade_docs -.-> cs_rewrite_query;
+	cs_retrieve_corpus --> cs_grade_docs;
+	cs_rewrite_query --> cs_retrieve_corpus;
+	end
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
 ```
 
 Control flow is enforced by the graph's edges, not by a system prompt the
-LLM may or may not follow. There is no loop: a turn makes at most 4 LLM
-calls (contextualize on follow-ups, router, corpus check, generation).
+LLM may or may not follow. The only loop is one bounded query rewrite per
+sub-query, and the research sub-agent has hard call limits. LLM calls per
+turn: 2 on the web route, 4 when the corpus answers on the first search
+(+1 per extra sub-query), ~10 on the full corrective path (+1 on follow-ups
+for `contextualize`).
 
 1. **`contextualize`** (LLM, follow-ups only): rewrites the latest message
    as a standalone question using the conversation, so "what benchmark did
@@ -77,17 +95,35 @@ calls (contextualize on follow-ups, router, corpus check, generation).
    - `out_of_scope` - not AI / software development.
 
    When unsure it picks `corpus`, because that path can still fall back to
-   the web and the web path never checks the corpus.
+   live search and the web path never checks the corpus.
 3. **`decline`**: out of scope → fixed message, no retrieval, no generation.
-4. **`retrieve_corpus`**: embeds the standalone question and retrieves the
-   top-k chunks from Pinecone.
-5. **`check_corpus`** (LLM, `CorpusCheck`): does the retrieved text actually
-   answer the question? Yes → `generate`; no → `web_search`.
-6. **`web_search`** (Tavily): on the web route, the only documents; on the
-   corpus fallback, added to the corpus documents.
-7. **`generate`** (LLM): answers the user's question (with the conversation)
-   only from the documents, citing them, and says plainly when they don't
-   answer it.
+4. **`decompose`** (LLM, `SubQueries`): splits a multi-part question into
+   self-contained sub-queries (at most `max_sub_queries`, 3); a single-part
+   question stays one query. Each sub-query is sent, in parallel (`Send`),
+   to its own run of the `corpus_search` subgraph:
+   - **`retrieve_corpus`**: embeds the query and retrieves the top-k (5)
+     chunks from Pinecone; chunks already seen in this run are skipped.
+   - **`grade_docs`** (LLM, `DocGrades`, model `grader_model`): grades every
+     new chunk against the *sub-query* in one call and keeps the
+     best-ranked relevant ones, at most `max_relevant_docs` (3) per
+     sub-query.
+   - **`rewrite_query`** (LLM): if fewer than `min_relevant_docs` (1) are
+     relevant, a better query in the vocabulary of paper abstracts, then
+     search again - at most `max_query_rewrites` (1) times.
+   - **`report`**: hands the sub-query's result back (relevant chunks,
+     everything retrieved, enough or not).
+5. **`merge_results`**: joins the runs - relevant chunks in sub-query order,
+   de-duplicated - and lists the sub-queries the corpus didn't cover. All
+   covered → `generate`; otherwise → `fallback_research`.
+6. **`fallback_research`** (`research.py`): a small `create_agent` ReAct
+   sub-agent with `web_search` (Tavily) and `arxiv_search` (live arXiv API)
+   tools, capped by `ModelCallLimitMiddleware` / `ToolCallLimitMiddleware`,
+   told which parts are missing. It only searches; the documents its tools
+   return are handed to `generate`, with the relevant corpus chunks.
+7. **`web_search`** (Tavily): the direct web route.
+8. **`generate`** (LLM): answers the user's question (with the conversation)
+   only from the documents, citing them. The "grounded in the corpus" /
+   "includes a live search" line is chosen by the graph from the documents.
 
 The UI and evals read the outcome from the final state: `route`
 (`corpus` / `web` / `decline`) and `documents` (both corpus and web, in one
@@ -97,14 +133,15 @@ The UI and evals read the outcome from the final state: `route`
 
 | File | Purpose |
 |---|---|
-| `config.py` | `AgentConfig` — LLM model/temperature, retrieval `top_k`, web-search result count. Composes `EmbeddingConfig` from `ingestion/` so queries are embedded with the same model/dimension/index as the corpus. |
-| `state.py` | `AgentState` (graph state) and `Document` (one shape for corpus and web results). |
-| `schemas.py` | Structured LLM outputs: `RouteDecision`, `CorpusCheck`. |
+| `config.py` | `AgentConfig` — models (`llm_model`, `grader_model`), retrieval `top_k`, corrective-RAG knobs (`max_sub_queries`, `min_relevant_docs`, `max_relevant_docs`, `max_query_rewrites`), research sub-agent call limits. Composes `EmbeddingConfig` from `ingestion/` so queries are embedded with the same model/dimension/index as the corpus. |
+| `state.py` | `AgentState` (graph state), `CorpusSearchState` / `SubQueryResult` (the per-sub-query subgraph), and `Document` (one shape for corpus chunks, web results and live-arXiv papers). |
+| `schemas.py` | Structured LLM outputs: `RouteDecision`, `SubQueries`, `DocGrades`. |
 | `prompts.py` | One narrow prompt per LLM node, plus the decline message. |
-| `components.py` | `AgentComponents`: the LLM / corpus / web functions the nodes call. Injected into `build_graph()` so control flow is unit-tested with fakes (`tests/test_graph.py`). |
-| `nodes.py` | The node functions `(state, components) -> state update` and the routing functions for the conditional edges. |
-| `graph.py` | Wiring only: `build_graph()` (nodes, edges, `InMemorySaver` checkpointer) and `studio_graph()` for `langgraph dev`. |
+| `components.py` | `AgentComponents`: every external call the nodes make (LLMs, corpus, web, research sub-agent). Injected into `build_graph()` so control flow is unit-tested with fakes (`tests/test_graph.py`). |
+| `nodes.py` | The node functions `(state, components[, settings]) -> state update` and the routing functions for the conditional edges. |
+| `graph.py` | Wiring only: `build_graph()` (nodes, edges, `InMemorySaver` checkpointer), `build_corpus_search()` (the per-sub-query subgraph) and `studio_graph()` for `langgraph dev`. |
 | `retrieval.py` | `make_corpus_search()` (Pinecone query used by `retrieve_corpus`) and the `search_papers` tool wrapping it for tool-calling agents. |
+| `research.py` | The `fallback_research` sub-agent: `create_agent` + call-limit middleware, `web_search` and `arxiv_search` tools returning `Document`s. |
 | `results.py` | `sources_from_documents()` (deduplicated citations) and `answer_badge()` (corpus / web / not-grounded badge) from the final state. Used by the UI; unit-tested. |
 | `../ui/chat_app.py` | Streamlit chat interface: session state, rendering, styling. |
 
@@ -128,5 +165,5 @@ RUN_INGESTION_INTEGRATION_TESTS=1 uv run pytest integration_tests/test_ingestion
 ```
 
 The agent suite covers every path: the corpus route, the direct web route,
-the corpus → web fallback, the out-of-scope decline, and a follow-up
-resolved from conversation history.
+the corrective path ending in `fallback_research`, the out-of-scope decline,
+and a follow-up resolved from conversation history.
