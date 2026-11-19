@@ -23,8 +23,15 @@ then routed down one of four paths:
 | **Practical tool / library / docs question** | Goes straight to web search — papers don't cover how to configure LangSmith. |
 | **Out of scope** (cooking, trivia, …) | Declines politely, with no search and no generation. If nothing relevant turns up anywhere, it says so rather than guessing. |
 
+Whatever the path, the answer is then **fact-checked before you see it**:
+a separate check splits the draft into individual claims and verifies each
+against the sources. Unsupported claims are revised away; parts of the
+question the draft skipped get one targeted search. After at most 3 drafts
+the best one is shown, with a note if it still didn't fully check out.
+
 Each answer in the chat UI has a collapsible "Sources" list, labeled by
-whether it came from the corpus or the web.
+whether it came from the corpus or the web, and a line saying whether it
+passed the fact-check.
 
 ## Quickstart
 
@@ -53,6 +60,11 @@ is set — see [agent/README.md](agent/README.md#tests).
 ## How it works
 
 ```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
 graph TD;
 	__start__([<p>__start__</p>]):::first
 	contextualize(contextualize)
@@ -63,20 +75,28 @@ graph TD;
 	web_search(web_search)
 	generate(generate)
 	merge_results(merge_results)
+	reflect(reflect)
+	search_aspects(search_aspects)
+	finalize(finalize)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> contextualize;
 	contextualize --> router;
 	cs_report --> merge_results;
 	decompose -.-> cs___start__;
 	fallback_research --> generate;
+	generate --> reflect;
 	merge_results -.-> fallback_research;
 	merge_results -.-> generate;
+	reflect -.-> finalize;
+	reflect -.-> generate;
+	reflect -.-> search_aspects;
 	router -.-> decline;
 	router -.-> decompose;
 	router -.-> web_search;
+	search_aspects --> generate;
 	web_search --> generate;
 	decline --> __end__;
-	generate --> __end__;
+	finalize --> __end__;
 	subgraph corpus_search
 	cs___start__(<p>__start__</p>)
 	cs_retrieve_corpus(retrieve_corpus)
@@ -105,10 +125,15 @@ prompt the model may or may not follow:
   `rewrite_query` once → `merge_results` → `generate`, or
   `fallback_research` for uncovered parts — a ReAct sub-agent with web and
   live-arXiv tools and hard call limits;
-- `generate` answers only from the relevant sources, with citations.
+- `generate` drafts an answer only from the relevant sources, with
+  citations → `reflect` checks it claim by claim (structured `Critique`) →
+  `finalize`, or revise (`generate` again with the critique), or
+  `search_aspects` for parts of the question it skipped. At most 3 drafts;
+  then the best one, with a caveat.
 
-The only loop is one query rewrite per sub-query: 2–5 LLM calls on the
-common paths, ~10 on the full corrective path (OpenAI `gpt-5-mini`). Node-by-node
+Both loops are bounded (one query rewrite per sub-query, 3 drafts): 3–6 LLM
+calls on the common paths when the first draft passes, more with revisions
+(OpenAI `gpt-5-mini`). Node-by-node
 details in [agent/README.md](agent/README.md); how it got here, phase by
 phase, in [docs/phases/](docs/phases/).
 

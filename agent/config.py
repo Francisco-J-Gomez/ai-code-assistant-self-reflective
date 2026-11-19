@@ -35,6 +35,14 @@ class AgentConfig:
     research_max_tool_calls: int = 4
     arxiv_search_max_results: int = 5
 
+    # Self-reflection (Phase 4)
+    reflect_model: str = "gpt-5-mini"  # checks each draft against its sources; own prompt, separate from generate
+    # "low" makes reflect ~40% faster but missed real unsupported claims in
+    # the pre-eval check (1 of 3 on corpus-09), so the default stays "medium".
+    reflect_reasoning_effort: str = "medium"
+    max_iterations: int = 3  # drafts per turn (first draft + revisions); then the best one is returned
+    max_missing_aspects: int = 2  # missing aspects searched for (once per turn) after a critique
+
     # Composed rather than duplicated: the retrieval tool must embed
     # queries with the *same* model/dimension/index the ingestion side
     # used to build the corpus, or similarity search is meaningless.
@@ -45,3 +53,5 @@ class AgentConfig:
             raise ValueError(
                 f"need 1 <= min_relevant_docs ({self.min_relevant_docs}) <= max_relevant_docs ({self.max_relevant_docs})"
             )
+        if self.max_iterations < 1:
+            raise ValueError(f"need max_iterations >= 1 (got {self.max_iterations})")

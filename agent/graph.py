@@ -1,5 +1,5 @@
 """The agent as an explicit LangGraph StateGraph (docs/self-reflective-plan.md,
-Phases 1-3). This module only wires the graph; node logic is in
+Phases 1-4). This module only wires the graph; node logic is in
 agent/nodes.py, external calls in agent/components.py.
 
     START -> contextualize -> router --out_of_scope--> decline --> END
@@ -14,16 +14,28 @@ agent/nodes.py, external calls in agent/components.py.
                   ^                  | too few                                |           |
                   +-- rewrite_query <+ (once; then report anyway)             |           |
                                                                               v           v
-                                    merge_results --all parts covered----> generate --> END
-                                          | some part not covered            ^
-                                          v                                  |
-                                  fallback_research (ReAct: web + live arXiv)+
+                                    merge_results --all parts covered----> generate
+                                          | some part not covered            ^   |
+                                          v                                  |   |
+                                  fallback_research (ReAct: web + live arXiv)+   |
+                                                                                 v
+         self-reflection:   generate (draft / revision) -> reflect (claim check) --passed--> finalize --> END
+                               ^   ^                         |  |                               ^
+                               |   +---- unsupported claims -+  +-- max_iterations drafts ------+
+                               |                             |       (best draft + caveat)
+                               +---- search_aspects <--------+ missing aspects (once)
 
 Phase 3 (corrective RAG): a multi-part question is split into sub-queries;
 each gets its own retrieval, per-document grading (at most
 max_relevant_docs kept) and one query rewrite if too few are relevant.
 Parts the corpus still doesn't cover go to a bounded research sub-agent
-(web + live arXiv). The only loop is the single rewrite per sub-query.
+(web + live arXiv).
+
+Phase 4 (self-reflection): every draft is checked claim by claim against
+its documents (reflect). Unsupported claims -> revise; unanswered parts of
+the question -> one targeted search, then revise. At most max_iterations
+drafts; if none passes, finalize returns the best one with a caveat.
+Loops: one rewrite per sub-query, and the bounded reflection loop.
 """
 import asyncio
 from functools import partial
@@ -75,7 +87,14 @@ def build_graph(
     builder.add_edge("fallback_research", "generate")
 
     builder.add_edge("web_search", "generate")
-    builder.add_edge("generate", END)
+
+    builder.add_node("reflect", partial(nodes.reflect, c=c))
+    builder.add_node("search_aspects", partial(nodes.search_aspects, c=c, settings=config))
+    builder.add_node("finalize", nodes.finalize)
+    builder.add_edge("generate", "reflect")
+    builder.add_conditional_edges("reflect", partial(nodes.route_after_reflect, settings=config), ["finalize", "search_aspects", "generate"])
+    builder.add_edge("search_aspects", "generate")
+    builder.add_edge("finalize", END)
 
     return builder.compile(checkpointer=checkpointer)
 

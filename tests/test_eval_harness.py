@@ -2,7 +2,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
 from agent.state import Document
-from evals.evaluators import NOT_APPLICABLE, cost_signals, retrieval_hit, retrieval_recall, route_correct
+from agent.schemas import ClaimCheck, Critique
+from evals.evaluators import NOT_APPLICABLE, cost_signals, reflection_signals, retrieval_hit, retrieval_recall, route_correct
 from evals.targets import UsageCounter, make_graph_target, outputs_from_state
 
 PAPER_A = Document(kind="corpus", title="TA", url="https://arxiv.org/abs/a", text="abstract a", arxiv_id="a")
@@ -128,3 +129,29 @@ def test_cost_signals():
 def test_cost_signals_stay_within_langsmith_score_limit():
     scores = {r["key"]: r["score"] for r in cost_signals(_outputs(input_tokens=160_000, output_tokens=1_197))["results"]}
     assert scores["ktokens"] == 161.2 < 99_999
+
+
+def test_outputs_reflection_fields():
+    state = _state("corpus", [PAPER_A])
+    state["iteration"] = 2
+    state["critique"] = Critique(claims=[ClaimCheck(claim="c", supported=False)], missing_aspects=[], problems=[])
+    out = outputs_from_state(state, _usage())
+    assert (out["drafts"], out["self_check_passed"]) == (2, False)
+
+    out = outputs_from_state(_state("decline", []), _usage(calls=1))
+    assert (out["drafts"], out["self_check_passed"]) == (0, None)
+
+
+def test_reflection_signals():
+    scores = {r["key"]: r["score"] for r in reflection_signals(_outputs(drafts=2, self_check_passed=True))["results"]}
+    assert scores == {"drafts": 2, "self_check_passed": 1}
+    assert reflection_signals(_outputs(drafts=0, self_check_passed=None)) == NOT_APPLICABLE
+    assert reflection_signals(_outputs()) == NOT_APPLICABLE  # outputs from earlier phases
+
+
+def test_config_rejects_zero_iterations():
+    import pytest
+    from agent.config import AgentConfig
+
+    with pytest.raises(ValueError):
+        AgentConfig(max_iterations=0)

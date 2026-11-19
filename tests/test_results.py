@@ -36,3 +36,15 @@ def test_badge_per_route():
     assert answer_badge("corpus")["kind"] == "corpus"
     assert answer_badge("decline")["kind"] == "none"
     assert answer_badge(None)["kind"] == "none"
+
+
+def test_self_check_note():
+    from agent.results import self_check_note
+    from agent.schemas import ClaimCheck, Critique
+
+    ok = Critique(claims=[ClaimCheck(claim="a", supported=True)], missing_aspects=[], problems=[])
+    bad = Critique(claims=[ClaimCheck(claim="a", supported=False)], missing_aspects=[], problems=[])
+    assert self_check_note(ok, 1) == "✅ Fact-checked against its sources"
+    assert self_check_note(ok, 2) == "✅ Fact-checked against its sources after 1 revision"
+    assert self_check_note(bad, 3).startswith("⚠️ Didn't fully pass the fact-check after 2 revisions")
+    assert self_check_note(None, 0) is None  # declined: no draft

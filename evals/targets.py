@@ -14,6 +14,8 @@ Output keys:
     context          the documents the answer was generated from
     llm_calls        number of LLM calls in the turn
     input_tokens / output_tokens
+    drafts           drafts written by the reflection loop (Phase 4+; 0 = no draft, e.g. decline)
+    self_check_passed  whether the returned draft passed reflect's check (None without a critique)
 """
 import uuid
 
@@ -61,6 +63,8 @@ def outputs_from_state(state: dict, usage: UsageCounter) -> dict:
         "llm_calls": usage.llm_calls,
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
+        "drafts": state.get("iteration", 0),
+        "self_check_passed": critique.passed if (critique := state.get("critique")) is not None else None,
     }
 
 

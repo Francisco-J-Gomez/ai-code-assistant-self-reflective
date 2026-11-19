@@ -12,6 +12,8 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
+from agent.schemas import Critique
+
 Route = Literal["corpus", "web", "decline"]
 
 
@@ -94,3 +96,11 @@ class AgentState(BaseModel):
     # What generate answers from: corpus chunks graded relevant, plus web /
     # live-arXiv results.
     documents: list[Document] = Field(default_factory=list)
+
+    # Self-reflection loop. A draft only becomes a chat message in finalize.
+    draft: str = ""
+    critique: Critique | None = None  # of the current draft
+    iteration: int = 0  # drafts written this turn
+    aspects_searched: bool = False  # missing aspects get one targeted search per turn
+    best_draft: str = ""
+    best_critique: Critique | None = None

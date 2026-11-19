@@ -7,9 +7,8 @@ control flow, and AgentComponents holds everything that touches the network
 - so each piece can be tested on its own with fakes.
 
 Nodes of the corpus_search subgraph take CorpusSearchState (one
-sub-query); the rest take AgentState. When Phase 4 adds the reflection nodes
-(reflect, revise), this module splits into a package by concern
-(nodes/retrieval.py, nodes/reflection.py, ...).
+sub-query); the rest take AgentState. Sections follow the flow:
+understanding the question, corpus path, web route, self-reflection.
 """
 from typing import Literal
 
@@ -18,7 +17,8 @@ from langgraph.types import Overwrite, Send
 
 from agent.components import AgentComponents
 from agent.config import AgentConfig
-from agent.prompts import DECLINE_MESSAGE
+from agent.prompts import DECLINE_MESSAGE, caveat
+from agent.schemas import Critique
 from agent.state import AgentState, CorpusSearchState, SubQueryResult
 
 
@@ -63,6 +63,12 @@ def contextualize(state: AgentState, c: AgentComponents) -> dict:
         "missing": [],
         "retrieved": [],
         "documents": [],
+        "draft": "",
+        "critique": None,
+        "iteration": 0,
+        "aspects_searched": False,
+        "best_draft": "",
+        "best_critique": None,
     }
 
 
@@ -165,10 +171,64 @@ def web_search(state: AgentState, c: AgentComponents) -> dict:
     return {"documents": c.search_web(state.standalone_question)}
 
 
+# --- self-reflection: draft -> reflect -> (revise | search aspects) -> finalize
+
+
 def generate(state: AgentState, c: AgentComponents) -> dict:
+    """Write a draft. After a failed critique this is the revision: the
+    previous draft and the critique's issues go into the prompt."""
     _, history = split_latest_question(state.messages)
-    answer = c.generate(state.question, history, state.documents)
-    return {"messages": [AIMessage(answer)]}
+    revision = (state.draft, state.critique) if state.critique and not state.critique.passed else None
+    draft = c.generate(state.question, history, state.documents, revision)
+    return {"draft": draft, "iteration": state.iteration + 1}
+
+
+def _rank(critique: Critique) -> tuple:
+    return (critique.passed, critique.score, -len(critique.missing_aspects), -len(critique.problems))
+
+
+def reflect(state: AgentState, c: AgentComponents) -> dict:
+    """Check the draft claim by claim against the documents it was written
+    from, and keep the best draft so far (by critique, ties -> the earlier)."""
+    critique = c.reflect(state.standalone_question, state.draft, state.documents)
+    update: dict = {"critique": critique}
+    if state.best_critique is None or _rank(critique) > _rank(state.best_critique):
+        update |= {"best_draft": state.draft, "best_critique": critique}
+    return update
+
+
+def search_aspects(state: AgentState, c: AgentComponents, settings: AgentConfig) -> dict:
+    """The draft skipped parts of the question: one targeted search for
+    them - corpus first (graded like any sub-query), then the research
+    sub-agent for aspects the corpus doesn't cover. Runs once per turn."""
+    aspects = state.critique.missing_aspects[: settings.max_missing_aspects]
+    known = {d.key for d in state.documents}
+    found, uncovered = [], []
+    for aspect in aspects:
+        new = [d for d in c.search_corpus(aspect) if d.key not in known]
+        grades = c.grade_documents(aspect, new) if new else []
+        relevant = [d for d, ok in zip(new, grades) if ok][: settings.max_relevant_docs]
+        if not relevant:
+            uncovered.append(aspect)
+        found += relevant
+        known |= {d.key for d in relevant}
+    documents = dedupe([*state.documents, *found])
+    update = {"aspects_searched": True, "retrieved": dedupe([*state.retrieved, *found])}
+    if uncovered:
+        live = c.research(state.standalone_question, uncovered, documents)
+        if live:
+            documents = [*documents, *live]
+            update["route"] = "web"
+    return update | {"documents": documents}
+
+
+def finalize(state: AgentState) -> dict:
+    """The answer the user sees: the current draft if it passed the check,
+    otherwise the best draft of the turn with a caveat."""
+    if state.critique is not None and state.critique.passed:
+        return {"messages": [AIMessage(state.draft)]}
+    best = state.best_draft or state.draft
+    return {"messages": [AIMessage(best + caveat(state.best_critique or state.critique))]}
 
 
 # --- routing (conditional edges) ---------------------------------------------
@@ -180,6 +240,18 @@ def route_after_router(state: AgentState) -> Literal["decline", "decompose", "we
 
 def route_after_merge(state: AgentState) -> Literal["generate", "fallback_research"]:
     return "fallback_research" if state.missing else "generate"
+
+
+def route_after_reflect(state: AgentState, settings: AgentConfig) -> Literal["finalize", "search_aspects", "generate"]:
+    """good -> finalize; out of drafts -> finalize (best draft + caveat);
+    parts of the question unanswered (first time) -> search for them, then
+    revise; otherwise (unsupported claims / problems) -> revise."""
+    critique = state.critique
+    if critique.passed or state.iteration >= settings.max_iterations:
+        return "finalize"
+    if critique.missing_aspects and not state.aspects_searched:
+        return "search_aspects"
+    return "generate"
 
 
 def route_after_grade_docs(state: CorpusSearchState, settings: AgentConfig) -> Literal["report", "rewrite_query"]:

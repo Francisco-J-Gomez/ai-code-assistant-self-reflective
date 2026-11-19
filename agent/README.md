@@ -23,7 +23,9 @@ Opens a browser tab with a chat UI. Ask anything about AI/software-dev
 research or tools — research questions are answered from the relevant papers
 in the corpus (retrying with a rewritten query, then searching the web and
 live arXiv if too few are relevant), practical tool/library questions go
-straight to web search, and anything unrelated is declined. Each
+straight to web search, and anything unrelated is declined. Every answer
+is fact-checked against its sources before it is shown (and revised if it
+isn't supported); a line under the answer says whether it passed. Each
 answer has a collapsible "Sources" list, deduplicated by URL and labeled by
 whether it came from the paper corpus or the web. The **New Chat** button
 starts a fresh conversation thread.
@@ -34,6 +36,11 @@ An explicit LangGraph `StateGraph` (`graph.py`). The actual compiled
 structure (`graph.get_graph().draw_mermaid()`, not hand-drawn):
 
 ```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
 graph TD;
 	__start__([<p>__start__</p>]):::first
 	contextualize(contextualize)
@@ -44,20 +51,28 @@ graph TD;
 	web_search(web_search)
 	generate(generate)
 	merge_results(merge_results)
+	reflect(reflect)
+	search_aspects(search_aspects)
+	finalize(finalize)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> contextualize;
 	contextualize --> router;
 	cs_report --> merge_results;
 	decompose -.-> cs___start__;
 	fallback_research --> generate;
+	generate --> reflect;
 	merge_results -.-> fallback_research;
 	merge_results -.-> generate;
+	reflect -.-> finalize;
+	reflect -.-> generate;
+	reflect -.-> search_aspects;
 	router -.-> decline;
 	router -.-> decompose;
 	router -.-> web_search;
+	search_aspects --> generate;
 	web_search --> generate;
 	decline --> __end__;
-	generate --> __end__;
+	finalize --> __end__;
 	subgraph corpus_search
 	cs___start__(<p>__start__</p>)
 	cs_retrieve_corpus(retrieve_corpus)
@@ -76,11 +91,13 @@ graph TD;
 ```
 
 Control flow is enforced by the graph's edges, not by a system prompt the
-LLM may or may not follow. The only loop is one bounded query rewrite per
-sub-query, and the research sub-agent has hard call limits. LLM calls per
-turn: 2 on the web route, 4 when the corpus answers on the first search
-(+1 per extra sub-query), ~10 on the full corrective path (+1 on follow-ups
-for `contextualize`).
+LLM may or may not follow. Both loops are bounded: one query rewrite per
+sub-query, and at most `max_iterations` (3) drafts in the reflection loop;
+the research sub-agent has hard call limits. LLM calls per turn when the
+first draft passes the check: 3 on the web route, 5 when the corpus answers
+on the first search (+1 per extra sub-query), ~11 on the full corrective
+path; each revision adds 2 (`generate` + `reflect`), a targeted search for
+missing aspects ~1–5 more (+1 on follow-ups for `contextualize`).
 
 1. **`contextualize`** (LLM, follow-ups only): rewrites the latest message
    as a standalone question using the conversation, so "what benchmark did
@@ -121,28 +138,46 @@ for `contextualize`).
    told which parts are missing. It only searches; the documents its tools
    return are handed to `generate`, with the relevant corpus chunks.
 7. **`web_search`** (Tavily): the direct web route.
-8. **`generate`** (LLM): answers the user's question (with the conversation)
-   only from the documents, citing them. The "grounded in the corpus" /
-   "includes a live search" line is chosen by the graph from the documents.
+8. **`generate`** (LLM): writes a *draft* answer to the user's question
+   (with the conversation) only from the documents, citing them. The
+   "grounded in the corpus" / "includes a live search" line is chosen by the
+   graph from the documents. On a revision it also gets its previous draft
+   and the critique's issues.
+9. **`reflect`** (LLM, `Critique`, model `reflect_model`, its own
+   fact-checker prompt): splits the draft into atomic claims and checks
+   each against the documents (supported / unsupported, with what the
+   sources actually say); lists parts of the question the draft ignores
+   (`missing_aspects`) and other problems (a false premise accepted, an
+   offer to search more). The verdict - `passed`, `score` (share of
+   supported claims) - is computed in code from those lists. Then:
+   - passed → `finalize`;
+   - missing aspects, first time this turn → **`search_aspects`**: corpus
+     search + grading per aspect (at most `max_missing_aspects`, 2), the
+     research sub-agent for aspects the corpus lacks → `generate`;
+   - otherwise (unsupported claims, problems) → `generate` (revise);
+   - `max_iterations` drafts written → `finalize`.
+10. **`finalize`**: the only node that writes the answer to the chat: the
+    draft that passed, or else the best-scoring draft of the turn with a
+    short caveat saying what didn't check out.
 
 The UI and evals read the outcome from the final state: `route`
-(`corpus` / `web` / `decline`) and `documents` (both corpus and web, in one
-`Document` shape).
+(`corpus` / `web` / `decline`), `documents` (both corpus and web, in one
+`Document` shape), and `critique` / `iteration` for the self-check.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `config.py` | `AgentConfig` — models (`llm_model`, `grader_model`), retrieval `top_k`, corrective-RAG knobs (`max_sub_queries`, `min_relevant_docs`, `max_relevant_docs`, `max_query_rewrites`), research sub-agent call limits. Composes `EmbeddingConfig` from `ingestion/` so queries are embedded with the same model/dimension/index as the corpus. |
+| `config.py` | `AgentConfig` — models (`llm_model`, `grader_model`, `reflect_model`), retrieval `top_k`, corrective-RAG knobs (`max_sub_queries`, `min_relevant_docs`, `max_relevant_docs`, `max_query_rewrites`), research sub-agent call limits, reflection knobs (`max_iterations`, `max_missing_aspects`). Composes `EmbeddingConfig` from `ingestion/` so queries are embedded with the same model/dimension/index as the corpus. |
 | `state.py` | `AgentState` (graph state), `CorpusSearchState` / `SubQueryResult` (the per-sub-query subgraph), and `Document` (one shape for corpus chunks, web results and live-arXiv papers). |
-| `schemas.py` | Structured LLM outputs: `RouteDecision`, `SubQueries`, `DocGrades`. |
-| `prompts.py` | One narrow prompt per LLM node, plus the decline message. |
+| `schemas.py` | Structured LLM outputs: `RouteDecision`, `SubQueries`, `DocGrades`, `Critique` (claims, missing aspects, problems; `passed` / `score` computed from them). |
+| `prompts.py` | One narrow prompt per LLM node, the revision instructions built from a critique, the decline message and the caveat. |
 | `components.py` | `AgentComponents`: every external call the nodes make (LLMs, corpus, web, research sub-agent). Injected into `build_graph()` so control flow is unit-tested with fakes (`tests/test_graph.py`). |
 | `nodes.py` | The node functions `(state, components[, settings]) -> state update` and the routing functions for the conditional edges. |
 | `graph.py` | Wiring only: `build_graph()` (nodes, edges, `InMemorySaver` checkpointer), `build_corpus_search()` (the per-sub-query subgraph) and `studio_graph()` for `langgraph dev`. |
 | `retrieval.py` | `make_corpus_search()` (Pinecone query used by `retrieve_corpus`) and the `search_papers` tool wrapping it for tool-calling agents. |
 | `research.py` | The `fallback_research` sub-agent: `create_agent` + call-limit middleware, `web_search` and `arxiv_search` tools returning `Document`s. |
-| `results.py` | `sources_from_documents()` (deduplicated citations) and `answer_badge()` (corpus / web / not-grounded badge) from the final state. Used by the UI; unit-tested. |
+| `results.py` | `sources_from_documents()` (deduplicated citations), `answer_badge()` (corpus / web / not-grounded badge) and `self_check_note()` (fact-check line) from the final state. Used by the UI; unit-tested. |
 | `../ui/chat_app.py` | Streamlit chat interface: session state, rendering, styling. |
 
 Conversation memory is process-local (lost when the Streamlit server
@@ -165,5 +200,7 @@ RUN_INGESTION_INTEGRATION_TESTS=1 uv run pytest integration_tests/test_ingestion
 ```
 
 The agent suite covers every path: the corpus route, the direct web route,
-the corrective path ending in `fallback_research`, the out-of-scope decline,
-and a follow-up resolved from conversation history.
+the corrective path ending in `fallback_research`, a multi-part question,
+the out-of-scope decline, and a follow-up resolved from conversation
+history; every answered turn is checked to have gone through the bounded
+reflection loop, and the real `reflect` must flag a planted wrong number.

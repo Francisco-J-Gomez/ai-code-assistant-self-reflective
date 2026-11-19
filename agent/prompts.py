@@ -129,6 +129,12 @@ is there to understand the question, not as a source.
 web result as "Title" linked to its URL.
 - If the sources don't answer the question, say so plainly. Never fill gaps \
 with general knowledge, and never invent papers, numbers or results.
+- Stay as close to the sources' own wording as you can. Don't add \
+qualifiers or characterizations they don't make ("static", "inherently", \
+"consistently"), don't generalize beyond them ("several papers" when one \
+says it), and don't draw causes or contrasts they don't draw. Only state \
+what a paper doesn't contain if a source says so; otherwise say the \
+sources don't mention it. Use only the URLs given in the sources.
 - If the question asks about a paper, model or result that none of the \
 sources mention, say directly that you found no such paper/model/result, \
 and don't treat it as real. Don't pad the answer with summaries of other \
@@ -146,6 +152,93 @@ up...", "let me know if...").
 SOURCES:
 {documents}
 """
+
+REFLECT_PROMPT = """\
+You are a strict fact-checker. Check a draft ANSWER to a QUESTION against \
+the SOURCES it was written from. Use only the sources - not your own \
+knowledge - to decide what is supported.
+
+1. claims: split the answer into atomic factual claims (each finding, \
+number, method description, attribution of a result to a paper, statement \
+that something does or doesn't exist) and check each one:
+   - supported: a source states it - in the same strength and scope. A \
+statement about the sources ("the corpus contains no paper on X") is \
+supported if it is true of the sources below.
+   - unsupported: no source states it, a number differs from the source, a \
+metric is reported under the wrong name, or a finding is attributed to the \
+wrong paper. Also unsupported, even if plausible: a qualifier or \
+characterization the source doesn't use ("static", "inherently", \
+"consistently", "cross-file"); a generalization beyond the sources \
+("several papers" when one says it, "studies show" for one study); a cause, \
+comparison or contrast the source doesn't draw; a claim about what a paper \
+does NOT contain, unless the source says so; a URL that isn't in the \
+sources. Judge strictly: a reasonable inference is still unsupported. Say \
+in the note what the sources actually say.
+   Skip framing sentences, the line saying where the answer comes from, \
+and citations themselves.
+2. missing_aspects: things the QUESTION explicitly asks that the answer \
+ignores completely. Only what the question's own words ask for - never \
+details you think a complete answer could add ("more numbers", "authors", \
+"other roles"). A part is addressed if the answer covers it, says the \
+sources don't cover it, or says the paper/model/result it is about doesn't \
+exist in the sources (then everything about that thing is addressed). Most \
+answers have none.
+3. problems: a premise of the question that the sources contradict but the \
+answer accepts; a paper, model or result treated as real that no source \
+shows; closing offers to search more or requests for material from the \
+user.
+
+Return empty lists when there is nothing to report.
+
+QUESTION:
+{question}
+
+ANSWER:
+{draft}
+
+SOURCES:
+{documents}
+"""
+
+REVISION_PROMPT = """\
+
+REVISION: a fact-checker compared your previous draft (below) with the \
+sources. Write the full answer again, keeping everything that was supported \
+and fixing exactly these issues:
+{issues}
+
+PREVIOUS DRAFT:
+{draft}
+"""
+
+
+def format_issues(critique) -> str:
+    """The critique as instructions for revise."""
+    lines = [
+        f"- Unsupported claim: \"{c.claim}\" - {c.note or 'no source states this'}. Remove it or correct it from the sources."
+        for c in critique.unsupported_claims
+    ]
+    lines += [f"- Problem: {p}" for p in critique.problems]
+    lines += [
+        f"- Not answered: {a}. Answer it from the sources if they cover it; otherwise say plainly that the sources don't."
+        for a in critique.missing_aspects
+    ]
+    return "\n".join(lines)
+
+
+def caveat(critique) -> str:
+    """Appended by finalize when no draft passed the fact-check."""
+    if critique is None or critique.passed:
+        return ""
+    reasons = []
+    if critique.unsupported_claims:
+        reasons.append("some statements could not be verified against the sources")
+    if critique.missing_aspects:
+        reasons.append("it may not fully cover: " + "; ".join(critique.missing_aspects))
+    if critique.problems and not reasons:
+        reasons.append("the fact-check flagged issues it could not resolve")
+    return "\n\n---\n*Note: this answer didn't fully pass the fact-check - " + ", and ".join(reasons) + ".*"
+
 
 # Which sources were used is a fact the graph knows, so the label comes from
 # the documents, not from the model's judgement (it once called a web
