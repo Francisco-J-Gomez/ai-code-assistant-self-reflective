@@ -25,7 +25,10 @@ from evals.dataset_io import DATASET_NAME  # noqa: E402
 from evals.evaluators import CODE_EVALUATORS, make_llm_judges  # noqa: E402
 from evals.targets import make_graph_target  # noqa: E402
 
-SUMMARY_KEYS = ["route_correct", "retrieval_hit", "retrieval_recall", "correctness", "groundedness", "llm_calls", "ktokens"]
+SUMMARY_KEYS = [
+    "route_correct", "retrieval_hit", "retrieval_recall", "correctness", "groundedness",
+    "drafts", "self_check_passed", "llm_calls", "ktokens",
+]
 
 
 def _git_sha() -> str:
@@ -73,10 +76,10 @@ def _print_summary(results) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--experiment-prefix", default="phase3-crag")
+    parser.add_argument("--experiment-prefix", default="phase4-reflect")
     parser.add_argument(
         "--description",
-        default="Phase 3: corrective RAG - grade_docs, one rewrite_query retry, fallback_research sub-agent (web + live arXiv).",
+        default="Phase 4: self-reflection - claim-level reflect on every draft, revise / targeted search for missing aspects, best draft + caveat after max_iterations.",
     )
     parser.add_argument("--grader-model", default="gpt-5", help="LLM judge model (should differ from / be stronger than the agent's)")
     parser.add_argument("--split", action="append", help="only run this category (repeatable)")
@@ -105,6 +108,10 @@ def main() -> None:
             "min_relevant_docs": agent_config.min_relevant_docs,
             "max_relevant_docs": agent_config.max_relevant_docs,
             "max_query_rewrites": agent_config.max_query_rewrites,
+            "reflect_model": agent_config.reflect_model,
+            "reflect_reasoning_effort": agent_config.reflect_reasoning_effort,
+            "max_iterations": agent_config.max_iterations,
+            "max_missing_aspects": agent_config.max_missing_aspects,
             "splits": args.split or "all",
         },
         max_concurrency=args.concurrency,

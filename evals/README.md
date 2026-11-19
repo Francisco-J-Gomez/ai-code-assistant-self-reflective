@@ -191,3 +191,53 @@ web route moved by as much), LLM calls 2.7 → 4.1. Corpus recall 0.54 →
 0.45 is `decompose` rephrasing single-part questions differently per run —
 a retrieval-only check shows no systematic loss (0.54 vs 0.53). Details:
 [docs/phases/phase-3-corrective-rag.md](../docs/phases/phase-3-corrective-rag.md#results).
+
+## Phase 4 — `phase4-reflect-3a55de44` (2026-11-19)
+
+Agent: Phase 3 + `generate` (draft) → `reflect` (claim-level `Critique`,
+`gpt-5-mini`, effort `medium`) → revise / `search_aspects` → `finalize`
+(best draft + caveat after `max_iterations = 3`).
+
+| category | route | retr. hit | recall | correct | grounded | drafts | self-check | LLM calls | k-tokens | latency (s) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| corpus | 1.00 | 1.00 | 0.55 | 0.75 | 0.60 | 1.60 | 0.90 | 6.3 | 18.1 | 159.0 |
+| follow_up | 1.00 | 1.00 | 0.77 | 0.83 | 0.80 | 1.40 | 1.00 | 6.2 | 11.8 | 136.6 |
+| hallucination_trap | 0.83 | 0.50 | 0.30 | 1.00 | 0.83 | 1.67 | 1.00 | 10.2 | 25.5 | 125.7 |
+| multi_part | 1.00 | 1.00 | 0.81 | 0.83 | 0.67 | 1.50 | 1.00 | 7.2 | 26.0 | 270.7 |
+| out_of_scope | 1.00 | – | – | 1.00 | – | – | – | 1.0 | 0.5 | 3.1 |
+| web | 1.00 | – | – | 0.92 | 0.67 | 1.33 | 1.00 | 3.7 | 11.5 | 84.4 |
+| **ALL** | **0.97** | **0.92** | **0.62** | **0.88** | **0.70** | 1.52 | 0.97 | 5.80 | 15.8 | 132.8 |
+
+vs. Phase 3 (`phase3-crag-1c490aad`): groundedness 0.68 → 0.70 (flat),
+correctness 0.88 → 0.88, trap correctness 0.83 → 1.00 (`halluc-05` fixed),
+latency ~3×, tokens 2.4×. The agent's own check passes 97% of answers while
+the judge gives 0.5 to 20 of 33 — mostly for small paraphrase
+embellishments `reflect` accepts. Details:
+[docs/phases/phase-4-self-reflection.md](../docs/phases/phase-4-self-reflection.md#results).
+
+**Follow-up, tightened `reflect` / `generate` prompts —
+`phase4-reflect-fe6a373a` (multi_part split only, 6 questions):**
+groundedness 0.67 → 0.83, correctness 0.83, drafts 1.67, self-check 0.83,
+7.5 LLM calls, 25.2 k-tokens, 123.2 s mean latency (was 270.7 s).
+
+### Phase 4 final — `phase4-reflect-2a7e1156` (2026-11-19)
+
+Tightened `reflect` / `generate` prompts, full dataset.
+
+| category | route | retr. hit | recall | correct | grounded | drafts | self-check | LLM calls | k-tokens | latency (s) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| corpus | 0.90 | 0.90 | 0.42 | 0.70 | 0.80 | 1.60 | 1.00 | 6.2 | 17.9 | 124.6 |
+| follow_up | 1.00 | 1.00 | 0.83 | 0.92 | 0.70 | 1.20 | 1.00 | 5.8 | 10.6 | 118.7 |
+| hallucination_trap | 0.83 | 0.50 | 0.30 | 1.00 | 0.75 | 1.17 | 1.00 | 10.2 | 21.5 | 260.0 |
+| multi_part | 1.00 | 1.00 | 0.61 | 0.75 | 1.00 | 1.33 | 1.00 | 6.8 | 21.5 | 154.3 |
+| out_of_scope | 1.00 | – | – | 1.00 | – | – | – | 1.0 | 0.5 | 2.8 |
+| web | 1.00 | – | – | 0.83 | 0.83 | 1.00 | 1.00 | 3.0 | 8.3 | 47.1 |
+| **ALL** | **0.95** | **0.88** | **0.53** | **0.85** | **0.82** | 1.30 | 1.00 | 5.58 | 13.8 | 118.6 |
+
+**Per question (median):** 58.7 s latency.
+
+vs. Phase 3 (`phase3-crag-1c490aad`): **groundedness 0.68 → 0.82**
+(multi-part 1.00), correctness 0.88 → 0.85 (misses are papers not
+retrieved — Phase 5), trap correctness 0.83 → 1.00, median latency
+48 → 59 s, tokens 2×.
+

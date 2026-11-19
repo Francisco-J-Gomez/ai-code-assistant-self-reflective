@@ -5,8 +5,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from agent import nodes
 from agent.config import AgentConfig
-from agent.prompts import CORPUS_ONLY_NOTE, DECLINE_MESSAGE, source_note
-from agent.schemas import RouteDecision
+from agent.prompts import CORPUS_ONLY_NOTE, DECLINE_MESSAGE, caveat, format_issues, source_note
+from agent.schemas import ClaimCheck, Critique, RouteDecision
 from langgraph.types import Overwrite, Send
 
 from agent.state import AgentState, CorpusSearchState, Document, SubQueryResult
@@ -57,6 +57,12 @@ def test_contextualize_first_turn_skips_the_llm_and_resets_per_turn_fields():
         "missing": [],
         "retrieved": [],
         "documents": [],
+        "draft": "",
+        "critique": None,
+        "iteration": 0,
+        "aspects_searched": False,
+        "best_draft": "",
+        "best_critique": None,
     }
 
 
@@ -263,3 +269,135 @@ def test_source_note_is_decided_by_the_documents_not_the_model():
     assert "a live web search" in source_note([PAPER, WEB])
     assert "a live arXiv search" in source_note([PAPER, LIVE])
     assert "a live web search and a live arXiv search" in source_note([WEB, LIVE])
+
+
+# --- self-reflection -----------------------------------------------------------
+
+
+def _critique(supported=(), unsupported=(), missing=(), problems=()):
+    claims = [ClaimCheck(claim=c, supported=True) for c in supported]
+    claims += [ClaimCheck(claim=c, supported=False, note=f"no source says {c}") for c in unsupported]
+    return Critique(claims=claims, missing_aspects=list(missing), problems=list(problems))
+
+
+GOOD = _critique(supported=["a", "b"])
+
+
+def test_critique_verdict_is_computed_from_its_lists():
+    assert GOOD.passed and GOOD.grounded and GOOD.score == 1.0
+    half = _critique(supported=["a"], unsupported=["b"])
+    assert not half.passed and not half.grounded and half.score == 0.5
+    assert [c.claim for c in half.unsupported_claims] == ["b"]
+    assert not _critique(supported=["a"], missing=["x"]).passed  # grounded but incomplete
+    assert not _critique(supported=["a"], problems=["accepts a false premise"]).passed
+    assert _critique().score == 1.0  # no factual claims: nothing unsupported
+
+
+def test_generate_writes_a_draft_not_a_message_and_counts_it():
+    stub = Stub(generate=lambda q, h, docs, revision: f"draft for {q}, revision={revision}")
+    update = nodes.generate(AgentState(messages=[HumanMessage("q")], question="q", documents=[PAPER]), stub)
+    assert update == {"draft": "draft for q, revision=None", "iteration": 1}
+
+
+def test_generate_after_a_failed_critique_revises_the_previous_draft():
+    bad = _critique(unsupported=["x"])
+    seen = []
+    stub = Stub(generate=lambda q, h, docs, revision: seen.append(revision) or "v2")
+    state = AgentState(messages=[HumanMessage("q")], question="q", draft="v1", critique=bad, iteration=1)
+    assert nodes.generate(state, stub) == {"draft": "v2", "iteration": 2}
+    assert seen == [("v1", bad)]
+
+
+def test_reflect_checks_the_draft_against_the_documents_and_tracks_the_best():
+    seen = []
+    stub = Stub(reflect=lambda q, draft, docs: seen.append((q, draft, docs)) or GOOD)
+    state = AgentState(standalone_question="sq", draft="d", documents=[PAPER])
+    assert nodes.reflect(state, stub) == {"critique": GOOD, "best_draft": "d", "best_critique": GOOD}
+    assert seen == [("sq", "d", [PAPER])]
+
+
+@pytest.mark.parametrize(
+    "new, keeps_best",
+    [
+        (_critique(supported=["a"], unsupported=["b", "c"]), True),  # worse score
+        (_critique(supported=["a"], unsupported=["b"]), True),  # tie -> keep the earlier draft
+        (_critique(supported=["a", "b", "c"], unsupported=["d"]), False),  # better score
+    ],
+)
+def test_reflect_replaces_the_best_draft_only_when_the_new_one_is_better(new, keeps_best):
+    best = _critique(supported=["a"], unsupported=["b"])
+    state = AgentState(draft="new", best_draft="old", best_critique=best)
+    update = nodes.reflect(state, Stub(reflect=lambda q, d, docs: new))
+    assert ("best_draft" not in update) == keeps_best
+
+
+def test_search_aspects_searches_the_corpus_first_and_research_for_the_rest():
+    critique = _critique(supported=["a"], missing=["in corpus", "not in corpus", "over the cap"])
+    corpus = {"in corpus": [PAPER, PAPER_2, PAPER_3], "not in corpus": [PAPER_3]}
+    research_calls = []
+    stub = Stub(
+        search_corpus=lambda q: corpus.get(q, []),
+        grade_documents=lambda q, docs: [d is not PAPER_3 for d in docs],
+        research=lambda q, missing, known: research_calls.append((q, missing, [d.title for d in known])) or [LIVE],
+    )
+    state = AgentState(standalone_question="sq", critique=critique, documents=[PAPER], route="corpus")
+    update = nodes.search_aspects(state, stub, AgentConfig(max_missing_aspects=2))
+
+    # PAPER was already a document; PAPER_2 is new and relevant; PAPER_3 is graded off-topic.
+    assert research_calls == [("sq", ["not in corpus"], ["P", "P2"])]
+    assert update == {"aspects_searched": True, "retrieved": [PAPER_2], "documents": [PAPER, PAPER_2, LIVE], "route": "web"}
+
+
+def test_search_aspects_without_new_documents_makes_no_grading_call():
+    def fail(q, docs):
+        raise AssertionError("nothing new to grade")
+
+    stub = Stub(search_corpus=lambda q: [PAPER], grade_documents=fail, research=lambda q, m, k: [])
+    state = AgentState(critique=_critique(missing=["x"]), documents=[PAPER], route="corpus")
+    update = nodes.search_aspects(state, stub, AgentConfig())
+    assert update == {"aspects_searched": True, "retrieved": [], "documents": [PAPER]}  # route unchanged
+
+
+def test_finalize_returns_the_passing_draft_as_is():
+    update = nodes.finalize(AgentState(draft="final", critique=GOOD, best_draft="final", best_critique=GOOD))
+    assert update["messages"][0].content == "final"
+
+
+def test_finalize_without_a_passing_draft_returns_the_best_one_with_a_caveat():
+    best = _critique(supported=["a"], unsupported=["b"])
+    state = AgentState(draft="last", critique=_critique(unsupported=["x", "y"]), best_draft="best", best_critique=best)
+    content = nodes.finalize(state)["messages"][0].content
+    assert content.startswith("best\n\n---")
+    assert "could not be verified" in content
+
+
+def test_caveat_names_what_is_missing():
+    assert caveat(GOOD) == "" and caveat(None) == ""
+    text = caveat(_critique(supported=["a"], missing=["test generation"]))
+    assert "may not fully cover: test generation" in text
+    assert "flagged issues" in caveat(_critique(problems=["offers to search more"]))
+
+
+def test_format_issues_turns_the_critique_into_revision_instructions():
+    text = format_issues(_critique(supported=["ok"], unsupported=["x"], missing=["m"], problems=["p"]))
+    assert 'Unsupported claim: "x" - no source says x' in text
+    assert "- Problem: p" in text
+    assert "- Not answered: m." in text
+    assert "ok" not in text  # supported claims aren't issues
+
+
+@pytest.mark.parametrize(
+    "critique, iteration, searched, expected",
+    [
+        (GOOD, 1, False, "finalize"),
+        (_critique(unsupported=["x"]), 1, False, "generate"),
+        (_critique(problems=["p"]), 2, False, "generate"),
+        (_critique(unsupported=["x"]), 3, False, "finalize"),  # out of drafts
+        (_critique(missing=["m"]), 1, False, "search_aspects"),
+        (_critique(missing=["m"]), 2, True, "generate"),  # already searched this turn: just revise
+        (_critique(missing=["m"]), 3, False, "finalize"),
+    ],
+)
+def test_route_after_reflect(critique, iteration, searched, expected):
+    state = AgentState(critique=critique, iteration=iteration, aspects_searched=searched)
+    assert nodes.route_after_reflect(state, AgentConfig(max_iterations=3)) == expected

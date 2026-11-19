@@ -34,3 +34,14 @@ def answer_badge(route: str | None) -> dict:
     if route == "corpus":
         return {"icon": "📄", "label": "Grounded in the paper corpus", "kind": "corpus"}
     return {"icon": "❌", "label": "Not grounded — no relevant source found", "kind": "none"}
+
+
+def self_check_note(critique, drafts: int) -> str | None:
+    """One line on the reflection loop's verdict for the answer shown
+    (Phase 4). None when there was no draft (declined questions)."""
+    if critique is None or drafts == 0:
+        return None
+    revised = f" after {drafts - 1} revision{'s' if drafts > 2 else ''}" if drafts > 1 else ""
+    if critique.passed:
+        return f"✅ Fact-checked against its sources{revised}"
+    return f"⚠️ Didn't fully pass the fact-check{revised} — see the note at the end"

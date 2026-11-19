@@ -4,6 +4,7 @@ Code-based (free, deterministic):
     route_correct      did the agent take an acceptable route (corpus / web / decline)?
     retrieval_hit      was at least one expected paper retrieved? (only when papers are expected)
     retrieval_recall   fraction of expected papers retrieved
+    drafts, self_check_passed  reflection-loop signals (Phase 4+)
     llm_calls, ktokens   cost signals (tokens in thousands) (latency is recorded by LangSmith per run)
 
 LLM-as-judge (grader model deliberately stronger than the agent's model):
@@ -65,7 +66,19 @@ def cost_signals(outputs: dict) -> dict:
     }
 
 
-CODE_EVALUATORS = [route_correct, retrieval_hit, retrieval_recall, cost_signals]
+def reflection_signals(outputs: dict) -> dict:
+    """How hard the reflection loop worked (Phase 4): drafts per answer, and
+    whether the agent's own fact-check passed. Not applicable without a
+    draft (declines) or for runs from earlier phases."""
+    if not outputs.get("drafts"):
+        return NOT_APPLICABLE
+    results = [{"key": "drafts", "score": outputs["drafts"]}]
+    if outputs.get("self_check_passed") is not None:
+        results.append({"key": "self_check_passed", "score": int(outputs["self_check_passed"])})
+    return {"results": results}
+
+
+CODE_EVALUATORS = [route_correct, retrieval_hit, retrieval_recall, cost_signals, reflection_signals]
 
 
 # --- LLM-as-judge -------------------------------------------------------------

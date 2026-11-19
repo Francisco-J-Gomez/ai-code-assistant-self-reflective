@@ -16,8 +16,10 @@ import os
 
 import pytest
 
+from agent.components import make_components
 from agent.config import AgentConfig
 from agent.graph import build_graph
+from agent.state import Document
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_AGENT_INTEGRATION_TESTS") != "1",
@@ -31,10 +33,15 @@ def graph():
 
 
 def _ask(graph, question: str, thread_id: str) -> dict:
-    return graph.invoke(
+    result = graph.invoke(
         {"messages": [{"role": "user", "content": question}]},
         config={"configurable": {"thread_id": thread_id}},
     )
+    # Phase 4: every answered turn went through the bounded reflection loop.
+    if result["route"] != "decline":
+        assert 1 <= result["iteration"] <= AgentConfig().max_iterations
+        assert result["critique"] is not None
+    return result
 
 
 def test_in_corpus_question_answers_from_corpus_only(graph):
@@ -125,3 +132,30 @@ def test_follow_up_is_resolved_from_conversation_history(graph):
     assert result["route"] in ("corpus", "web")
     assert "repocoder" in result["standalone_question"].lower()
     assert "repoeval" in result["messages"][-1].content.lower()
+
+
+def test_reflect_flags_a_claim_the_sources_dont_support():
+    """The real fact-checker, on a draft with one planted wrong number."""
+    c = make_components(AgentConfig())
+    source = Document(
+        kind="corpus",
+        title="RepoCoder: Repository-Level Code Completion Through Iterative Retrieval and Generation",
+        url="https://arxiv.org/abs/2303.12570",
+        arxiv_id="2303.12570",
+        text=(
+            "RepoCoder is a framework for repository-level code completion that uses an iterative "
+            "retrieval-generation pipeline. We also introduce RepoEval, a benchmark built from recent "
+            "GitHub repositories. RepoCoder improves the in-file completion baseline by over 10% in all settings."
+        ),
+    )
+    draft = (
+        "RepoCoder (2303.12570) does repository-level code completion with iterative retrieval and generation, "
+        "and introduces the RepoEval benchmark. It improves the in-file baseline by 45% on HumanEval."
+    )
+    critique = c.reflect("What is RepoCoder and how much does it improve completion?", draft, [source])
+
+    assert not critique.grounded
+    flagged = " ".join(cl.claim for cl in critique.unsupported_claims).lower()
+    assert "45" in flagged or "humaneval" in flagged
+    # The true statements are not flagged.
+    assert not any("repoeval" in cl.claim.lower() and "45" not in cl.claim for cl in critique.unsupported_claims)

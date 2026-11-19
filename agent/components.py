@@ -18,14 +18,17 @@ from agent.prompts import (
     DECOMPOSE_PROMPT,
     GENERATE_PROMPT,
     GRADE_DOCS_PROMPT,
+    REFLECT_PROMPT,
+    REVISION_PROMPT,
     REWRITE_QUERY_PROMPT,
     ROUTER_PROMPT,
     format_documents,
+    format_issues,
     source_note,
 )
 from agent.research import make_research
 from agent.retrieval import make_corpus_search
-from agent.schemas import DocGrades, RouteDecision, SubQueries
+from agent.schemas import Critique, DocGrades, RouteDecision, SubQueries
 from agent.state import Document
 
 
@@ -48,8 +51,11 @@ class AgentComponents:
     # (question, parts the corpus didn't cover, documents already found)
     #   -> new documents (web / live arXiv)
     research: Callable[[str, list[str], list[Document]], list[Document]]
-    # (question, prior conversation, documents) -> answer text
-    generate: Callable[[str, list[AnyMessage], list[Document]], str]
+    # (question, prior conversation, documents, previous draft + its
+    #  critique for a revision, or None) -> answer text
+    generate: Callable[[str, list[AnyMessage], list[Document], tuple[str, Critique] | None], str]
+    # (question, draft, documents) -> claim-level critique of the draft
+    reflect: Callable[[str, str, list[Document]], Critique]
 
 
 def make_components(config: AgentConfig) -> AgentComponents:
@@ -66,6 +72,9 @@ def make_components(config: AgentConfig) -> AgentComponents:
     corpus_search = make_corpus_search(config)
     tavily = TavilySearch(max_results=config.web_search_max_results)
     research = make_research(config, llm)
+    reflect_llm = ChatOpenAI(
+        model=config.reflect_model, temperature=config.llm_temperature, reasoning_effort=config.reflect_reasoning_effort
+    ).with_structured_output(Critique)
 
     def contextualize(question: str, history: list[AnyMessage]) -> str:
         return llm.invoke([SystemMessage(CONTEXTUALIZE_PROMPT), *history, HumanMessage(question)]).content.strip()
@@ -115,15 +124,17 @@ def make_components(config: AgentConfig) -> AgentComponents:
             for r in response.get("results", [])
         ]
 
-    def generate(question: str, history: list[AnyMessage], documents: list[Document]) -> str:
-        response = llm.invoke(
-            [
-                SystemMessage(GENERATE_PROMPT.format(source_note=source_note(documents), documents=format_documents(documents))),
-                *history,
-                HumanMessage(question),
-            ]
-        )
-        return response.content
+    def generate(
+        question: str, history: list[AnyMessage], documents: list[Document], revision: tuple[str, Critique] | None = None
+    ) -> str:
+        system = GENERATE_PROMPT.format(source_note=source_note(documents), documents=format_documents(documents))
+        if revision:
+            draft, critique = revision
+            system += REVISION_PROMPT.format(issues=format_issues(critique), draft=draft)
+        return llm.invoke([SystemMessage(system), *history, HumanMessage(question)]).content
+
+    def reflect(question: str, draft: str, documents: list[Document]) -> Critique:
+        return reflect_llm.invoke(REFLECT_PROMPT.format(question=question, draft=draft, documents=format_documents(documents)))
 
     return AgentComponents(
         contextualize=contextualize,
@@ -135,4 +146,5 @@ def make_components(config: AgentConfig) -> AgentComponents:
         search_web=search_web,
         research=research,
         generate=generate,
+        reflect=reflect,
     )

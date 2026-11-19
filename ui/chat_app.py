@@ -31,7 +31,7 @@ except Exception:
 
 from agent.config import AgentConfig
 from agent.graph import build_graph
-from agent.results import answer_badge, sources_from_documents
+from agent.results import answer_badge, self_check_note, sources_from_documents
 
 st.set_page_config(page_title="AI / Software-Dev Research Assistant", page_icon="📄")
 
@@ -196,6 +196,8 @@ for turn in st.session_state.history:
         _render_badge(turn.get("badge"))
         st.markdown(turn["content"])
         _render_sources(turn.get("sources") or [])
+        if turn.get("check"):
+            st.caption(turn["check"])
 
 question = st.chat_input("Ask about AI or software-development research...")
 if question:
@@ -215,11 +217,14 @@ if question:
         answer = result["messages"][-1].content
         sources = sources_from_documents(result["documents"])
         badge = answer_badge(result["route"])
+        check = self_check_note(result.get("critique"), result.get("iteration", 0))
 
         _render_badge(badge)
         st.markdown(answer)
         _render_sources(sources)
+        if check:
+            st.caption(check)
 
     st.session_state.history.append(
-        {"role": "assistant", "content": answer, "sources": sources, "badge": badge}
+        {"role": "assistant", "content": answer, "sources": sources, "badge": badge, "check": check}
     )
