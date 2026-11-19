@@ -4,12 +4,20 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from agent import nodes
-from agent.prompts import DECLINE_MESSAGE
-from agent.schemas import CorpusCheck, RouteDecision
-from agent.state import AgentState, Document
+from agent.config import AgentConfig
+from agent.prompts import CORPUS_ONLY_NOTE, DECLINE_MESSAGE, source_note
+from agent.schemas import RouteDecision
+from langgraph.types import Overwrite, Send
+
+from agent.state import AgentState, CorpusSearchState, Document, SubQueryResult
 
 PAPER = Document(kind="corpus", title="P", url="https://arxiv.org/abs/1", text="...", arxiv_id="1")
+PAPER_2 = Document(kind="corpus", title="P2", url="https://arxiv.org/abs/2", text="...", arxiv_id="2")
+PAPER_3 = Document(kind="corpus", title="P3", url="https://arxiv.org/abs/3", text="...", arxiv_id="3")
 WEB = Document(kind="web", title="W", url="https://example.com", text="...")
+LIVE = Document(kind="arxiv", title="L", url="https://arxiv.org/abs/9", text="...", arxiv_id="9")
+
+CONFIG = AgentConfig(min_relevant_docs=2, max_query_rewrites=1)
 
 
 class Stub:
@@ -31,15 +39,23 @@ def test_split_latest_question_without_user_message_raises():
         nodes.split_latest_question([AIMessage("hi")])
 
 
+# --- contextualize / router / decline ----------------------------------------
+
+
 def test_contextualize_first_turn_skips_the_llm_and_resets_per_turn_fields():
     def fail(q, h):
         raise AssertionError("no history: contextualize must not call the LLM")
 
-    state = AgentState(messages=[HumanMessage("q")], route="web", documents=[PAPER])
-    assert nodes.contextualize(state, Stub(contextualize=fail)) == {
+    state = AgentState(messages=[HumanMessage("q")], route="web", sub_queries=["old"], missing=["old"], retrieved=[PAPER], documents=[PAPER])
+    update = nodes.contextualize(state, Stub(contextualize=fail))
+    assert update.pop("sub_results") == Overwrite([])  # append-reducer field: cleared explicitly
+    assert update == {
         "question": "q",
         "standalone_question": "q",
         "route": None,
+        "sub_queries": [],
+        "missing": [],
+        "retrieved": [],
         "documents": [],
     }
 
@@ -69,37 +85,181 @@ def test_decline_returns_fixed_message():
     assert update["messages"][0].content == DECLINE_MESSAGE
 
 
-@pytest.mark.parametrize("enough, route", [(True, "corpus"), (False, "web")])
-def test_check_corpus_sets_route_judging_the_standalone_question(enough, route):
+# --- corpus path: decompose / fan out / merge / fallback ---------------------
+
+
+def test_decompose_falls_back_to_the_question_if_nothing_comes_back():
+    update = nodes.decompose(AgentState(standalone_question="q"), Stub(decompose=lambda q: []))
+    assert update == {"sub_queries": ["q"]}
+
+
+def test_fan_out_sends_one_corpus_search_per_sub_query_with_its_index():
+    sends = nodes.fan_out_sub_queries(AgentState(sub_queries=["a", "b"]))
+    assert sends == [Send("corpus_search", {"index": 0, "sub_query": "a"}), Send("corpus_search", {"index": 1, "sub_query": "b"})]
+
+
+def _result(index, sub_query, documents, retrieved=None, enough=True):
+    return SubQueryResult(
+        index=index, sub_query=sub_query, search_query=sub_query, query_rewrites=0,
+        retrieved=retrieved or documents, documents=documents, enough=enough,
+    )
+
+
+def test_merge_results_orders_by_sub_query_dedupes_and_lists_missing_parts():
+    state = AgentState(
+        route="corpus",
+        sub_results=[  # finished out of order
+            _result(1, "b", [PAPER_2, PAPER_3], enough=False),
+            _result(0, "a", [PAPER, PAPER_2], retrieved=[PAPER, PAPER_2, WEB]),
+        ],
+    )
+    update = nodes.merge_results(state)
+    assert update["documents"] == [PAPER, PAPER_2, PAPER_3]
+    assert update["retrieved"] == [PAPER, PAPER_2, WEB, PAPER_3]
+    assert update["missing"] == ["b"]
+    assert update["route"] == "corpus"  # unchanged: fallback_research will set "web"
+
+
+def test_merge_results_sets_corpus_route_when_every_part_is_covered():
+    update = nodes.merge_results(AgentState(route="corpus", sub_results=[_result(0, "a", [PAPER, PAPER_2])]))
+    assert update["missing"] == [] and update["route"] == "corpus"
+
+
+def test_fallback_research_searches_the_missing_parts_and_keeps_corpus_documents():
+    seen = {}
+
+    def research(question, missing, known):
+        seen.update(question=question, missing=missing, known=known)
+        return [WEB, LIVE]
+
+    state = AgentState(standalone_question="q", missing=["part b"], documents=[PAPER])
+    update = nodes.fallback_research(state, Stub(research=research))
+    assert update == {"documents": [PAPER, WEB, LIVE], "route": "web"}
+    assert seen == {"question": "q", "missing": ["part b"], "known": [PAPER]}
+
+
+# --- corpus_search subgraph (one sub-query) -----------------------------------------
+
+
+def test_retrieve_corpus_only_keeps_chunks_not_seen_this_run():
+    rescored = PAPER.model_copy(update={"score": 0.9})  # same chunk, different score
+    c = Stub(search_corpus=lambda q: [rescored, PAPER_2])
+    update = nodes.retrieve_corpus(CorpusSearchState(sub_query="q", retrieved=[PAPER]), c)
+    assert update["candidates"] == [PAPER_2]
+    assert update["retrieved"] == [PAPER, PAPER_2]
+
+
+def test_retrieve_corpus_uses_the_rewritten_query_once_there_is_one():
     seen = []
-    c = Stub(check_corpus=lambda q, d: seen.append(q) or CorpusCheck(reasoning="", answers_question=enough))
-    state = AgentState(question="they?", standalone_question="RepoCoder?", documents=[PAPER])
-    assert nodes.check_corpus(state, c) == {"route": route}
-    assert seen == ["RepoCoder?"]
+    c = Stub(search_corpus=lambda q: seen.append(q) or [])
+    nodes.retrieve_corpus(CorpusSearchState(sub_query="q"), c)
+    nodes.retrieve_corpus(CorpusSearchState(sub_query="q", search_query="better q"), c)
+    assert seen == ["q", "better q"]
 
 
-def test_web_search_appends_to_corpus_documents():
-    c = Stub(search_web=lambda q: [WEB])
-    update = nodes.web_search(AgentState(standalone_question="q", documents=[PAPER]), c)
-    assert update["documents"] == [PAPER, WEB]
+def test_grade_docs_grades_against_the_sub_query_and_keeps_relevant_ones():
+    seen = []
+
+    def grade(q, docs):
+        seen.append(q)
+        return [True, False]
+
+    update = nodes.grade_docs(CorpusSearchState(sub_query="part a", candidates=[PAPER, PAPER_2]), Stub(grade_documents=grade), CONFIG)
+    assert update == {"documents": [PAPER], "candidates": []}
+    assert seen == ["part a"]
+
+
+def test_grade_docs_keeps_at_most_max_relevant_docs_in_ranking_order():
+    papers = [PAPER, PAPER_2, PAPER_3, PAPER.model_copy(update={"text": "chunk 2"})]
+    update = nodes.grade_docs(CorpusSearchState(sub_query="q", candidates=papers), Stub(grade_documents=lambda q, d: [True, False, True, True]), CONFIG)
+    assert update["documents"] == [PAPER, PAPER_3, papers[3]]  # 3 kept, PAPER_2 graded out
+
+
+def test_grade_docs_cap_counts_documents_kept_on_an_earlier_search():
+    state = CorpusSearchState(sub_query="q", documents=[PAPER, PAPER_2], candidates=[PAPER_3, PAPER_3.model_copy(update={"text": "x"})])
+    update = nodes.grade_docs(state, Stub(grade_documents=lambda q, d: [True, True]), CONFIG)
+    assert update["documents"] == [PAPER, PAPER_2, PAPER_3]
+
+
+def test_grade_docs_without_candidates_makes_no_llm_call():
+    def fail(q, d):
+        raise AssertionError("nothing to grade")
+
+    update = nodes.grade_docs(CorpusSearchState(sub_query="q", documents=[PAPER]), Stub(grade_documents=fail), CONFIG)
+    assert update["documents"] == [PAPER]
+
+
+def test_config_rejects_min_above_max():
+    with pytest.raises(ValueError):
+        AgentConfig(min_relevant_docs=4, max_relevant_docs=3)
+
+
+def test_rewrite_query_replaces_the_query_and_counts_the_retry():
+    seen = {}
+
+    def rewrite(question, query, found):
+        seen.update(question=question, query=query, found=found)
+        return "repository-level code completion retrieval"
+
+    state = CorpusSearchState(sub_query="q?", retrieved=[PAPER])
+    update = nodes.rewrite_query(state, Stub(rewrite_query=rewrite))
+    assert update == {"search_query": "repository-level code completion retrieval", "query_rewrites": 1}
+    assert seen == {"question": "q?", "query": "q?", "found": [PAPER]}
+
+
+def test_rewrite_query_keeps_the_old_query_if_the_rewrite_is_empty():
+    update = nodes.rewrite_query(CorpusSearchState(sub_query="q", search_query="q2"), Stub(rewrite_query=lambda *a: ""))
+    assert update["search_query"] == "q2"
+
+
+@pytest.mark.parametrize("documents, enough", [([PAPER, PAPER_2], True), ([PAPER], False)])
+def test_report_hands_back_one_result_with_enough_flag(documents, enough):
+    state = CorpusSearchState(index=2, sub_query="q", search_query="q2", query_rewrites=1, retrieved=[PAPER, PAPER_2, PAPER_3], documents=documents)
+    (result,) = nodes.report(state, CONFIG)["sub_results"]
+    assert (result.index, result.sub_query, result.search_query, result.query_rewrites) == (2, "q", "q2", 1)
+    assert result.documents == documents and result.enough is enough
+    assert len(result.retrieved) == 3
+
+
+def test_web_search_uses_only_web_results():
+    update = nodes.web_search(AgentState(standalone_question="q"), Stub(search_web=lambda q: [WEB]))
+    assert update["documents"] == [WEB]
+
+
+# --- routing -------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "route, after_router",
-    [("decline", "decline"), ("web", "web_search"), ("corpus", "retrieve_corpus"), (None, "retrieve_corpus")],
+    [("decline", "decline"), ("web", "web_search"), ("corpus", "decompose"), (None, "decompose")],
 )
 def test_route_after_router(route, after_router):
     assert nodes.route_after_router(AgentState(route=route)) == after_router
 
 
-@pytest.mark.parametrize("route, after_check", [("corpus", "generate"), ("web", "web_search")])
-def test_route_after_check_corpus(route, after_check):
-    assert nodes.route_after_check_corpus(AgentState(route=route)) == after_check
+def test_route_after_merge():
+    assert nodes.route_after_merge(AgentState(missing=[])) == "generate"
+    assert nodes.route_after_merge(AgentState(missing=["b"])) == "fallback_research"
+
+
+@pytest.mark.parametrize(
+    "documents, rewrites, expected",
+    [
+        ([PAPER, PAPER_2], 0, "report"),  # enough relevant
+        ([PAPER], 0, "rewrite_query"),  # too few, retry left
+        ([PAPER], 1, "report"),  # too few, no retry left: report "not enough"
+    ],
+)
+def test_route_after_grade_docs(documents, rewrites, expected):
+    state = CorpusSearchState(documents=documents, query_rewrites=rewrites)
+    assert nodes.route_after_grade_docs(state, CONFIG) == expected
+
+
+# --- prompt helpers -------------------------------------------------------------
 
 
 def test_source_note_is_decided_by_the_documents_not_the_model():
-    from agent.prompts import CORPUS_ONLY_NOTE, WITH_WEB_NOTE, source_note
-
     assert source_note([PAPER]) == CORPUS_ONLY_NOTE
-    assert source_note([PAPER, WEB]) == WITH_WEB_NOTE
-    assert source_note([WEB]) == WITH_WEB_NOTE
+    assert "a live web search" in source_note([PAPER, WEB])
+    assert "a live arXiv search" in source_note([PAPER, LIVE])
+    assert "a live web search and a live arXiv search" in source_note([WEB, LIVE])

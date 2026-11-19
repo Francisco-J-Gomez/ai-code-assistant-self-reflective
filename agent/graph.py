@@ -1,25 +1,29 @@
 """The agent as an explicit LangGraph StateGraph (docs/self-reflective-plan.md,
-Phases 1-2). This module only wires the graph; node logic is in
+Phases 1-3). This module only wires the graph; node logic is in
 agent/nodes.py, external calls in agent/components.py.
 
     START -> contextualize -> router --out_of_scope--> decline --> END
                                 |  |
-                                |  +--web (tool / library / docs)----+
-                                | corpus (research)                  |
-                                v                                    v
-                     retrieve_corpus -> check_corpus --not enough--> web_search
-                                            | enough                 |
-                                            v                        |
-                                        generate <-------------------+
-                                            |
-                                            v
-                                           END
+                                |  +--web (tool / library / docs)--> web_search ----------+
+                                | corpus (research)                                       |
+                                v                                                         |
+                           decompose --Send, one per sub-query, in parallel-->            |
+                                                                                          |
+         corpus_search (subgraph, per sub-query):                                         |
+             retrieve_corpus -> grade_docs (keep top relevant) --enough--> report         |
+                  ^                  | too few                                |           |
+                  +-- rewrite_query <+ (once; then report anyway)             |           |
+                                                                              v           v
+                                    merge_results --all parts covered----> generate --> END
+                                          | some part not covered            ^
+                                          v                                  |
+                                  fallback_research (ReAct: web + live arXiv)+
 
-The standalone question and the route are decided up front, each by its own
-node. Practical tool/library questions go straight to the web instead of
-through a corpus search that can only fail; research questions still check
-the corpus first and fall back to the web. No loop: at most 4 LLM calls per
-turn (contextualize only calls the LLM on follow-ups).
+Phase 3 (corrective RAG): a multi-part question is split into sub-queries;
+each gets its own retrieval, per-document grading (at most
+max_relevant_docs kept) and one query rewrite if too few are relevant.
+Parts the corpus still doesn't cover go to a bounded research sub-agent
+(web + live arXiv). The only loop is the single rewrite per sub-query.
 """
 import asyncio
 from functools import partial
@@ -30,7 +34,7 @@ from langgraph.graph import END, START, StateGraph
 from agent import nodes
 from agent.components import AgentComponents, make_components
 from agent.config import AgentConfig
-from agent.state import AgentState
+from agent.state import AgentState, CorpusSearchOutput, CorpusSearchState
 
 
 def build_graph(
@@ -55,19 +59,45 @@ def build_graph(
         checkpointer = None
 
     builder = StateGraph(AgentState)
-    for node in (nodes.contextualize, nodes.router, nodes.decline, nodes.retrieve_corpus, nodes.check_corpus, nodes.web_search, nodes.generate):
+    for node in (nodes.contextualize, nodes.router, nodes.decline, nodes.decompose, nodes.fallback_research, nodes.web_search, nodes.generate):
         builder.add_node(node.__name__, partial(node, c=c))
+    builder.add_node("corpus_search", build_corpus_search(c, config))
+    builder.add_node("merge_results", nodes.merge_results)
 
     builder.add_edge(START, "contextualize")
     builder.add_edge("contextualize", "router")
     builder.add_conditional_edges("router", nodes.route_after_router)
     builder.add_edge("decline", END)
-    builder.add_edge("retrieve_corpus", "check_corpus")
-    builder.add_conditional_edges("check_corpus", nodes.route_after_check_corpus)
+
+    builder.add_conditional_edges("decompose", nodes.fan_out_sub_queries, ["corpus_search"])
+    builder.add_edge("corpus_search", "merge_results")  # waits for every parallel run
+    builder.add_conditional_edges("merge_results", nodes.route_after_merge)
+    builder.add_edge("fallback_research", "generate")
+
     builder.add_edge("web_search", "generate")
     builder.add_edge("generate", END)
 
     return builder.compile(checkpointer=checkpointer)
+
+
+def build_corpus_search(c: AgentComponents, config: AgentConfig):
+    """The corrective retrieval loop for one sub-query, as a subgraph.
+
+    Only `sub_results` (one SubQueryResult) flows back to the parent graph
+    (output schema), so parallel runs can't clash on their working fields.
+    """
+    builder = StateGraph(CorpusSearchState, output_schema=CorpusSearchOutput)
+    builder.add_node("retrieve_corpus", partial(nodes.retrieve_corpus, c=c))
+    builder.add_node("grade_docs", partial(nodes.grade_docs, c=c, settings=config))
+    builder.add_node("rewrite_query", partial(nodes.rewrite_query, c=c))
+    builder.add_node("report", partial(nodes.report, settings=config))
+
+    builder.add_edge(START, "retrieve_corpus")
+    builder.add_edge("retrieve_corpus", "grade_docs")
+    builder.add_conditional_edges("grade_docs", partial(nodes.route_after_grade_docs, settings=config), ["report", "rewrite_query"])
+    builder.add_edge("rewrite_query", "retrieve_corpus")
+    builder.add_edge("report", END)
+    return builder.compile()
 
 
 _studio_graph = None

@@ -73,10 +73,10 @@ def _print_summary(results) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--experiment-prefix", default="phase2-router")
+    parser.add_argument("--experiment-prefix", default="phase3-crag")
     parser.add_argument(
         "--description",
-        default="Phase 2: contextualize -> router (corpus | web | out_of_scope) -> [retrieve_corpus -> check_corpus] -> [web_search] -> generate.",
+        default="Phase 3: corrective RAG - grade_docs, one rewrite_query retry, fallback_research sub-agent (web + live arXiv).",
     )
     parser.add_argument("--grader-model", default="gpt-5", help="LLM judge model (should differ from / be stronger than the agent's)")
     parser.add_argument("--split", action="append", help="only run this category (repeatable)")
@@ -101,6 +101,10 @@ def main() -> None:
             "agent_model": agent_config.llm_model,
             "grader_model": args.grader_model,
             "retrieval_top_k": agent_config.retrieval_top_k,
+            "doc_grader_model": agent_config.grader_model,
+            "min_relevant_docs": agent_config.min_relevant_docs,
+            "max_relevant_docs": agent_config.max_relevant_docs,
+            "max_query_rewrites": agent_config.max_query_rewrites,
             "splits": args.split or "all",
         },
         max_concurrency=args.concurrency,

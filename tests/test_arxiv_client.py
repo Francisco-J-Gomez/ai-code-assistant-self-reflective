@@ -200,3 +200,24 @@ def test_keyword_filter_rejects_paper_outside_all_configured_categories():
     )
     paper = make_paper(primary_category="cs.CV", categories=["cs.CV"], abstract="Code generation for images.")
     assert _passes_keyword_filter(paper, config) is False
+
+
+def test_search_arxiv_builds_an_and_keyword_query_sorted_by_relevance(monkeypatch):
+    captured = {}
+
+    def fake_get(params, max_retries):
+        captured["params"] = params
+        return feedparser.parse(FEED_XML)
+
+    monkeypatch.setattr(arxiv_client, "_get_with_retries", fake_get)
+    papers = arxiv_client.search_arxiv('code "review" automation?', max_results=3)
+
+    assert captured["params"]["search_query"] == "all:code AND all:review AND all:automation"
+    assert captured["params"]["sortBy"] == "relevance"
+    assert captured["params"]["max_results"] == 3
+    assert [p.arxiv_id for p in papers] == ["2301.12345"]
+
+
+def test_search_arxiv_empty_query_makes_no_request(monkeypatch):
+    monkeypatch.setattr(arxiv_client, "_get_with_retries", lambda *a: pytest.fail("no request expected"))
+    assert arxiv_client.search_arxiv("  ?! ") == []

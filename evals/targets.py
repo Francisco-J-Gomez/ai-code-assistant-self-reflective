@@ -10,7 +10,8 @@ Output keys:
     answer           final answer text
     route            "corpus" | "web" | "decline"
     retrieved_ids    arXiv ids retrieved from the corpus, in order, de-duplicated
-    context          retrieved text the answer should be grounded in
+                     (every corpus search this turn, before relevance grading)
+    context          the documents the answer was generated from
     llm_calls        number of LLM calls in the turn
     input_tokens / output_tokens
 """
@@ -43,9 +44,14 @@ class UsageCounter(BaseCallbackHandler):
 def outputs_from_state(state: dict, usage: UsageCounter) -> dict:
     """Build the standard output dict from the graph's final state."""
     documents = state.get("documents", [])
-    retrieved_ids = list(dict.fromkeys(d.arxiv_id for d in documents if d.kind == "corpus" and d.arxiv_id))
+    # Since Phase 3, `retrieved` holds every corpus chunk retrieved (graded
+    # or not) and `documents` only the relevant ones. Measuring retrieval on
+    # `retrieved` keeps retrieval_hit / recall comparable with earlier phases
+    # (which had no grading); what grading kept is visible in `context`.
+    retrieved = state.get("retrieved") or [d for d in documents if d.kind == "corpus"]
+    retrieved_ids = list(dict.fromkeys(d.arxiv_id for d in retrieved if d.arxiv_id))
     context = "\n\n".join(
-        f"[{d.arxiv_id if d.kind == 'corpus' else d.url}] {d.title}\n{d.text}" for d in documents
+        f"[{d.arxiv_id if d.kind in ('corpus', 'arxiv') else d.url}] {d.title}\n{d.text}" for d in documents
     )[:MAX_CONTEXT_CHARS]
     return {
         "answer": state["messages"][-1].content,

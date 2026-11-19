@@ -57,6 +57,29 @@ def fetch_papers(config: IngestionConfig) -> Iterator[PaperMetadata]:
             fetched += 1
 
 
+def search_arxiv(query: str, max_results: int = 5, max_retries: int = 2) -> list[PaperMetadata]:
+    """Keyword search over all of arXiv, most relevant first.
+
+    For interactive use (the agent's live arXiv tool), not bulk ingestion:
+    one request, no scope or keyword filter, few retries. Every word must
+    appear somewhere in the paper (`all:` field, AND-ed), so callers should
+    pass a few distinctive keywords rather than a full question.
+    """
+    terms = ["".join(ch for ch in word if ch.isalnum() or ch in "-.") for word in query.split()]
+    terms = [t for t in terms if t]
+    if not terms:
+        return []
+    params = {
+        "search_query": " AND ".join(f"all:{t}" for t in terms),
+        "start": 0,
+        "max_results": max_results,
+        "sortBy": "relevance",
+        "sortOrder": "descending",
+    }
+    feed = _get_with_retries(params, max_retries)
+    return [paper for paper in map(_parse_entry, feed.entries) if paper is not None]
+
+
 def _scope_queries(config: IngestionConfig) -> list[str]:
     """Build one search_query clause per full-scope category, plus one for
     the keyword-filtered categories - kept separate (rather than OR'd into a

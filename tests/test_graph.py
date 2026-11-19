@@ -4,22 +4,41 @@ state doesn't leak across turns of the same thread."""
 from langchain_core.messages import HumanMessage
 
 from agent.components import AgentComponents
+from agent.config import AgentConfig
 from agent.graph import build_graph
 from agent.prompts import DECLINE_MESSAGE
-from agent.schemas import CorpusCheck, RouteDecision
+from agent.schemas import RouteDecision
 from agent.state import Document
 
-PAPER = Document(kind="corpus", title="RepoCoder", url="https://arxiv.org/abs/2303.12570", text="...", arxiv_id="2303.12570")
+
+def _paper(title, n):
+    return Document(kind="corpus", title=title, url=f"https://arxiv.org/abs/{n}", text="...", arxiv_id=str(n))
+
+
+REPOCODER, RLCODER, CODERAG, GRAPHCODER = _paper("RepoCoder", 1), _paper("RLCoder", 2), _paper("CodeRAG", 3), _paper("GraphCoder", 4)
+TESTGEN, TESTBENCH, TESTEVAL = _paper("TestGen", 5), _paper("TestBench", 6), _paper("TestEval", 7)
+OFF_TOPIC = _paper("Flaky tests", 9)
 WEB = Document(kind="web", title="LangGraph docs", url="https://docs.langchain.com/x", text="...")
+LIVE = Document(kind="arxiv", title="New paper", url="https://arxiv.org/abs/2611.00001", text="...", arxiv_id="2611.00001")
+
+CONFIG = AgentConfig(min_relevant_docs=2, max_relevant_docs=3, max_query_rewrites=1)
+RELEVANT = {"RepoCoder", "RLCoder", "CodeRAG", "GraphCoder", "TestGen", "TestBench", "TestEval"}
 
 
 class FakeComponents:
-    """Records every call; behavior configured per test."""
+    """Records every call; behavior configured per test.
 
-    def __init__(self, *, route="corpus", standalone="standalone question", corpus_enough=True):
+    corpus: {query: [documents]} - what a corpus search returns for a query
+        (unknown queries return [OFF_TOPIC]). sub_queries: what decompose
+        returns (default: the question itself).
+    """
+
+    def __init__(self, *, route="corpus", standalone="standalone question", sub_queries=None, corpus=None, relevant=RELEVANT):
         self.route_to = route
         self.standalone = standalone
-        self.corpus_enough = corpus_enough
+        self.sub_queries = sub_queries
+        self.corpus = corpus or {}
+        self.relevant = relevant
         self.calls = []
 
     def contextualize(self, question, history):
@@ -30,17 +49,29 @@ class FakeComponents:
         self.calls.append(("route", question))
         return RouteDecision(reasoning="fake", route=self.route_to)
 
+    def decompose(self, question):
+        self.calls.append(("decompose", question))
+        return self.sub_queries or [question]
+
     def search_corpus(self, query):
         self.calls.append(("search_corpus", query))
-        return [PAPER]
+        return self.corpus.get(query, [OFF_TOPIC])
 
-    def check_corpus(self, question, documents):
-        self.calls.append(("check_corpus", question, len(documents)))
-        return CorpusCheck(reasoning="fake", answers_question=self.corpus_enough)
+    def grade_documents(self, question, documents):
+        self.calls.append(("grade_documents", question, [d.title for d in documents]))
+        return [d.title in self.relevant for d in documents]
+
+    def rewrite_query(self, question, query, found):
+        self.calls.append(("rewrite_query", question, query))
+        return f"rewritten: {question}"
 
     def search_web(self, query):
         self.calls.append(("search_web", query))
         return [WEB]
+
+    def research(self, question, missing, known):
+        self.calls.append(("research", question, missing, [d.title for d in known]))
+        return [WEB, LIVE]
 
     def generate(self, question, history, documents):
         self.calls.append(("generate", question, [m.content for m in history], [d.title for d in documents]))
@@ -50,9 +81,12 @@ class FakeComponents:
         return AgentComponents(
             contextualize=self.contextualize,
             route=self.route,
+            decompose=self.decompose,
             search_corpus=self.search_corpus,
-            check_corpus=self.check_corpus,
+            grade_documents=self.grade_documents,
+            rewrite_query=self.rewrite_query,
             search_web=self.search_web,
+            research=self.research,
             generate=self.generate,
         )
 
@@ -60,45 +94,148 @@ class FakeComponents:
         return [c[0] for c in self.calls]
 
 
+def _graph(fake, config=CONFIG, **kw):
+    return build_graph(config, components=fake.components(), **kw)
+
+
 def _ask(graph, question, thread_id="t1"):
     return graph.invoke({"messages": [HumanMessage(question)]}, config={"configurable": {"thread_id": thread_id}})
 
 
-def test_corpus_route_answers_from_corpus_without_web():
-    fake = FakeComponents(route="corpus", corpus_enough=True)
-    result = _ask(build_graph(components=fake.components()), "What is RepoCoder?")
+Q = "How does RAG help code completion?"
+
+
+# --- corpus path, one sub-query ------------------------------------------------
+
+
+def test_enough_relevant_papers_on_first_search_answers_from_corpus():
+    fake = FakeComponents(corpus={Q: [REPOCODER, OFF_TOPIC, RLCODER]})
+    result = _ask(_graph(fake), Q)
 
     # First turn: no history, so contextualize doesn't call the LLM.
-    assert fake.called() == ["route", "search_corpus", "check_corpus", "generate"]
+    assert fake.called() == ["route", "decompose", "search_corpus", "grade_documents", "generate"]
     assert result["route"] == "corpus"
-    assert result["standalone_question"] == "What is RepoCoder?"
-    assert result["documents"] == [PAPER]
-    assert result["messages"][-1].content == "answer to: What is RepoCoder?"
+    assert result["sub_queries"] == [Q]
+    # Only graded-relevant papers reach generate; everything retrieved is kept for evals.
+    assert result["documents"] == [REPOCODER, RLCODER]
+    assert result["retrieved"] == [REPOCODER, OFF_TOPIC, RLCODER]
 
 
-def test_corpus_route_falls_back_to_web_when_corpus_is_not_enough():
-    fake = FakeComponents(route="corpus", corpus_enough=False)
-    result = _ask(build_graph(components=fake.components()), "How does RepoCoder compare to Copilot?")
+def test_at_most_max_relevant_docs_are_kept_per_sub_query():
+    fake = FakeComponents(corpus={Q: [REPOCODER, RLCODER, CODERAG, GRAPHCODER]})
+    result = _ask(_graph(fake), Q)
 
-    assert fake.called() == ["route", "search_corpus", "check_corpus", "search_web", "generate"]
+    assert result["documents"] == [REPOCODER, RLCODER, CODERAG]  # best-ranked 3
+    assert len(result["retrieved"]) == 4
+
+
+def test_too_few_relevant_papers_rewrites_the_query_and_searches_again():
+    fake = FakeComponents(corpus={Q: [REPOCODER, OFF_TOPIC], f"rewritten: {Q}": [REPOCODER, CODERAG]})
+    result = _ask(_graph(fake), Q)
+
+    assert fake.called() == [
+        "route", "decompose", "search_corpus", "grade_documents", "rewrite_query",
+        "search_corpus", "grade_documents", "generate",
+    ]
+    # The retry only grades what is new (RepoCoder was already graded).
+    assert ("grade_documents", Q, ["CodeRAG"]) in fake.calls
+    assert result["route"] == "corpus"
+    assert result["documents"] == [REPOCODER, CODERAG]
+    assert result["sub_results"][0].query_rewrites == 1
+
+
+def test_still_not_enough_after_the_rewrite_falls_back_to_research():
+    fake = FakeComponents(corpus={Q: [REPOCODER, OFF_TOPIC]})  # the rewrite finds nothing new
+    result = _ask(_graph(fake), Q)
+
+    # Nothing new on the second search: no second grading call.
+    assert fake.called() == [
+        "route", "decompose", "search_corpus", "grade_documents", "rewrite_query",
+        "search_corpus", "research", "generate",
+    ]
+    # The research sub-agent is told what is missing and what the corpus gave...
+    assert ("research", Q, [Q], ["RepoCoder"]) in fake.calls
+    # ...and the relevant paper is kept next to what it found.
     assert result["route"] == "web"
-    # Corpus documents are kept alongside the web results.
-    assert result["documents"] == [PAPER, WEB]
+    assert result["documents"] == [REPOCODER, WEB, LIVE]
+
+
+def test_the_rewrite_loop_is_bounded_by_max_query_rewrites():
+    fake = FakeComponents(relevant=set())
+    _ask(_graph(fake, AgentConfig(max_query_rewrites=3)), "q")
+
+    assert fake.called().count("rewrite_query") == 3
+    assert fake.called()[-2:] == ["research", "generate"]
+
+
+def test_with_the_default_config_one_relevant_paper_covers_a_sub_query():
+    fake = FakeComponents(corpus={Q: [RLCODER, OFF_TOPIC]})
+    result = _ask(_graph(fake, AgentConfig()), Q)
+
+    assert "rewrite_query" not in fake.called() and "research" not in fake.called()
+    assert result["route"] == "corpus"
+    assert result["documents"] == [RLCODER]
+
+
+# --- corpus path, several sub-queries ----------------------------------------------
+
+
+TWO_PART = "How does RAG help code completion, and how are LLMs used to generate tests?"
+PART_1, PART_2 = "RAG for code completion", "LLMs for test generation"
+
+
+def test_each_sub_query_is_searched_and_graded_on_its_own_and_results_merge_in_order():
+    fake = FakeComponents(
+        sub_queries=[PART_1, PART_2],
+        corpus={PART_1: [REPOCODER, RLCODER, CODERAG, GRAPHCODER], PART_2: [TESTGEN, OFF_TOPIC, TESTBENCH, TESTEVAL]},
+    )
+    result = _ask(_graph(fake), TWO_PART)
+
+    # Each part graded against its own sub-query, not the whole question.
+    assert ("grade_documents", PART_1, ["RepoCoder", "RLCoder", "CodeRAG", "GraphCoder"]) in fake.calls
+    assert ("grade_documents", PART_2, ["TestGen", "Flaky tests", "TestBench", "TestEval"]) in fake.calls
+    # Up to 3 relevant per part, merged in sub-query order.
+    assert result["documents"] == [REPOCODER, RLCODER, CODERAG, TESTGEN, TESTBENCH, TESTEVAL]
+    assert result["route"] == "corpus"
+    assert result["missing"] == []
+    assert len(result["retrieved"]) == 8
+
+
+def test_only_the_part_the_corpus_misses_goes_to_research():
+    fake = FakeComponents(sub_queries=[PART_1, PART_2], corpus={PART_1: [REPOCODER, RLCODER]})  # PART_2: off-topic only
+    result = _ask(_graph(fake), TWO_PART)
+
+    assert fake.called().count("rewrite_query") == 1  # only part 2 retried
+    # Research gets the whole question for context, but only the missing part.
+    assert ("research", TWO_PART, [PART_2], ["RepoCoder", "RLCoder"]) in fake.calls
+    assert result["missing"] == [PART_2]
+    assert result["route"] == "web"
+    assert result["documents"] == [REPOCODER, RLCODER, WEB, LIVE]
+
+
+def test_a_chunk_found_by_two_sub_queries_is_kept_once():
+    fake = FakeComponents(sub_queries=[PART_1, PART_2], corpus={PART_1: [REPOCODER, RLCODER], PART_2: [RLCODER, TESTGEN]})
+    result = _ask(_graph(fake), TWO_PART)
+
+    assert result["documents"] == [REPOCODER, RLCODER, TESTGEN]
+
+
+# --- other routes ------------------------------------------------------------
 
 
 def test_web_route_skips_the_corpus():
     fake = FakeComponents(route="web")
-    result = _ask(build_graph(components=fake.components()), "How do I enable LangSmith tracing?")
+    result = _ask(_graph(fake), "How do I enable LangSmith tracing?")
 
     assert fake.called() == ["route", "search_web", "generate"]
-    assert ("search_web", "How do I enable LangSmith tracing?") in fake.calls
     assert result["route"] == "web"
     assert result["documents"] == [WEB]
+    assert result["retrieved"] == []
 
 
 def test_out_of_scope_declines_without_search_or_generation():
     fake = FakeComponents(route="out_of_scope")
-    result = _ask(build_graph(components=fake.components()), "How do I bake cookies?")
+    result = _ask(_graph(fake), "How do I bake cookies?")
 
     assert fake.called() == ["route"]
     assert result["route"] == "decline"
@@ -106,24 +243,26 @@ def test_out_of_scope_declines_without_search_or_generation():
     assert result["messages"][-1].content == DECLINE_MESSAGE
 
 
-def test_follow_up_is_contextualized_and_the_standalone_question_drives_routing_and_search():
+# --- conversation --------------------------------------------------------------
+
+
+def test_follow_up_is_contextualized_and_the_standalone_question_drives_routing_and_decomposition():
     fake = FakeComponents(standalone="What benchmark did RepoCoder introduce?")
-    graph = build_graph(components=fake.components())
+    graph = _graph(fake)
     _ask(graph, "What is RepoCoder?", thread_id="f")
     fake.calls.clear()
     result = _ask(graph, "What benchmark did they introduce?", thread_id="f")
 
     assert fake.calls[0] == ("contextualize", "What benchmark did they introduce?", ["What is RepoCoder?", "answer to: What is RepoCoder?"])
     assert ("route", "What benchmark did RepoCoder introduce?") in fake.calls
+    assert ("decompose", "What benchmark did RepoCoder introduce?") in fake.calls
     assert ("search_corpus", "What benchmark did RepoCoder introduce?") in fake.calls
-    assert ("check_corpus", "What benchmark did RepoCoder introduce?", 1) in fake.calls
     assert result["question"] == "What benchmark did they introduce?"
-    assert result["standalone_question"] == "What benchmark did RepoCoder introduce?"
 
 
 def test_generate_sees_the_original_question_and_prior_turns():
     fake = FakeComponents()
-    graph = build_graph(components=fake.components())
+    graph = _graph(fake)
     _ask(graph, "What is RepoCoder?", thread_id="h")
     _ask(graph, "What benchmark did they introduce?", thread_id="h")
 
@@ -133,32 +272,25 @@ def test_generate_sees_the_original_question_and_prior_turns():
     assert history == ["What is RepoCoder?", "answer to: What is RepoCoder?"]
 
 
-def test_per_turn_state_is_reset_on_a_declined_follow_up():
-    fake = FakeComponents(route="corpus")
-    graph = build_graph(components=fake.components())
-    _ask(graph, "What is RepoCoder?", thread_id="same")
+def test_per_turn_state_is_reset_between_turns():
+    fake = FakeComponents(sub_queries=[PART_1, PART_2], corpus={PART_1: [REPOCODER, RLCODER]})
+    graph = _graph(fake)
+    _ask(graph, TWO_PART, thread_id="same")
 
     fake.route_to = "out_of_scope"
     fake.standalone = "How do I bake cookies?"
     result = _ask(graph, "Unrelated, how do I bake cookies?", thread_id="same")
 
-    # The previous turn's papers don't leak into the declined turn.
     assert result["route"] == "decline"
     assert result["documents"] == []
+    assert result["retrieved"] == []
+    assert result["sub_results"] == []  # append-reducer field cleared with Overwrite
+    assert result["missing"] == []
     assert len(result["messages"]) == 4
 
 
-def test_empty_contextualization_falls_back_to_the_question():
-    fake = FakeComponents(standalone="")
-    graph = build_graph(components=fake.components())
-    _ask(graph, "What is RepoCoder?", thread_id="e")
-    result = _ask(graph, "code review automation", thread_id="e")
-
-    assert result["standalone_question"] == "code review automation"
-
-
 def test_graph_compiles_without_checkpointer_for_studio():
-    graph = build_graph(components=FakeComponents().components(), checkpointer=False)
+    graph = _graph(FakeComponents(corpus={"What is RepoCoder?": [REPOCODER, RLCODER]}), checkpointer=False)
     assert graph.checkpointer is None
     result = graph.invoke({"messages": [HumanMessage("What is RepoCoder?")]})
     assert result["route"] == "corpus"

@@ -185,6 +185,8 @@ def _render_sources(sources: list[dict]) -> None:
         for source in sources:
             if source["kind"] == "corpus":
                 st.markdown(f"📄 [{source['title']} ({source['arxiv_id']})]({source['url']})")
+            elif source["kind"] == "arxiv":
+                st.markdown(f"🔎 [{source['title']} ({source['arxiv_id']})]({source['url']}) — live arXiv search")
             else:
                 st.markdown(f"🌐 [{source['title']}]({source['url']})")
 

@@ -15,6 +15,13 @@ def test_sources_from_web_document_has_no_arxiv_id():
     assert sources_from_documents([WEB]) == [{"kind": "web", "title": "A Blog", "url": "https://example.com/post"}]
 
 
+def test_sources_from_live_arxiv_document_keep_arxiv_id():
+    live = Document(kind="arxiv", title="New", url="https://arxiv.org/abs/2611.00001", text="...", arxiv_id="2611.00001")
+    assert sources_from_documents([live]) == [
+        {"kind": "arxiv", "title": "New", "url": "https://arxiv.org/abs/2611.00001", "arxiv_id": "2611.00001"}
+    ]
+
+
 def test_sources_dedupe_by_url_keeping_order():
     second_chunk = PAPER.model_copy(update={"text": "another chunk"})
     assert [s["url"] for s in sources_from_documents([PAPER, WEB, second_chunk])] == [PAPER.url, WEB.url]

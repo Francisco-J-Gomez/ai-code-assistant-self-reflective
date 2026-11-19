@@ -46,6 +46,8 @@ def test_in_corpus_question_answers_from_corpus_only(graph):
 
     assert result["route"] == "corpus"
     assert result["documents"] and all(d.kind == "corpus" for d in result["documents"])
+    # Enough relevant papers on the first search, for every sub-query.
+    assert all(r.enough and r.query_rewrites == 0 for r in result["sub_results"])
 
     answer = result["messages"][-1].content.lower()
     assert "arxiv" in answer or "corpus" in answer or "paper" in answer
@@ -60,14 +62,16 @@ def test_tool_question_is_routed_straight_to_web_search(graph):
 
     assert result["route"] == "web"
     # Routed to the web up front: the corpus was never searched.
+    assert result["retrieved"] == []
     assert result["documents"] and all(d.kind == "web" for d in result["documents"])
 
 
-def test_research_question_the_corpus_cannot_answer_falls_back_to_web(graph):
-    # Routed to the corpus (it asks about a specific paper), but the
-    # RepoCoder text says nothing about GPT-7 or SWE-bench, so check_corpus
-    # sends it on to the web. False premise: GPT-7 doesn't exist and
-    # RepoCoder evaluated on RepoEval.
+def test_research_question_the_corpus_cannot_answer_falls_back_to_research(graph):
+    # Routed to the corpus (it asks about a specific paper), but no retrieved
+    # paper says anything about GPT-7 on SWE-bench: grade_docs finds too few
+    # relevant papers, the rewritten query doesn't help either, so the
+    # fallback_research sub-agent searches the web / live arXiv. False
+    # premise: GPT-7 doesn't exist and RepoCoder evaluated on RepoEval.
     result = _ask(
         graph,
         "What pass@1 did GPT-7 achieve on SWE-bench in the RepoCoder paper?",
@@ -75,15 +79,29 @@ def test_research_question_the_corpus_cannot_answer_falls_back_to_web(graph):
     )
 
     assert result["route"] == "web"
-    kinds = [d.kind for d in result["documents"]]
-    assert "corpus" in kinds and "web" in kinds  # corpus searched first, then web
+    assert result["retrieved"], "the corpus is searched first"
+    assert [r.query_rewrites for r in result["sub_results"]] == [1], "one corrective retry before the fallback"
+    assert any(d.kind in ("web", "arxiv") for d in result["documents"])
 
-    # Web sources were used, so the answer says so (the label is chosen by
+    # Live sources were used, so the answer says so (the label is chosen by
     # the graph from the documents, not by the model).
-    assert "web search" in result["messages"][-1].content.lower()
+    assert "live" in result["messages"][-1].content.lower()
     # Not asserted: that the answer doesn't close with an offer ("if you can
     # provide the paper..."). gpt-5-mini still does that in ~1 of 3 trap
     # answers despite the prompt; Phase 4's reflect step is the fix.
+
+
+def test_multi_part_question_is_searched_per_part(graph):
+    result = _ask(
+        graph,
+        "How are LLMs used to generate unit tests, and what benchmarks exist to evaluate generated tests?",
+        "integration-test-multi-part",
+    )
+
+    assert len(result["sub_queries"]) == 2
+    assert len(result["sub_results"]) == 2
+    # Each part keeps at most max_relevant_docs (3) of its own papers.
+    assert all(len(r.documents) <= 3 for r in result["sub_results"])
 
 
 def test_out_of_scope_question_is_declined_without_retrieval(graph):
@@ -94,7 +112,7 @@ def test_out_of_scope_question_is_declined_without_retrieval(graph):
     )
 
     assert result["route"] == "decline"
-    assert result["documents"] == []
+    assert result["documents"] == [] and result["retrieved"] == []
 
     answer = result["messages"][-1].content.lower()
     assert "chocolate" not in answer and "flour" not in answer  # didn't just answer it

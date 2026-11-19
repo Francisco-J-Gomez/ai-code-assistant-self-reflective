@@ -1,5 +1,5 @@
 """The external, side-effecting pieces the graph's nodes call: LLM calls,
-corpus search, web search.
+corpus search, web search, the fallback research sub-agent.
 
 They are bundled in AgentComponents and injected into build_graph(), so the
 graph's control flow can be unit-tested with plain fakes (no network, no
@@ -13,9 +13,19 @@ from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 
 from agent.config import AgentConfig
-from agent.prompts import CHECK_CORPUS_PROMPT, CONTEXTUALIZE_PROMPT, GENERATE_PROMPT, ROUTER_PROMPT, format_documents, source_note
+from agent.prompts import (
+    CONTEXTUALIZE_PROMPT,
+    DECOMPOSE_PROMPT,
+    GENERATE_PROMPT,
+    GRADE_DOCS_PROMPT,
+    REWRITE_QUERY_PROMPT,
+    ROUTER_PROMPT,
+    format_documents,
+    source_note,
+)
+from agent.research import make_research
 from agent.retrieval import make_corpus_search
-from agent.schemas import CorpusCheck, RouteDecision
+from agent.schemas import DocGrades, RouteDecision, SubQueries
 from agent.state import Document
 
 
@@ -25,33 +35,48 @@ class AgentComponents:
     contextualize: Callable[[str, list[AnyMessage]], str]
     # standalone question -> corpus / web / out of scope
     route: Callable[[str], RouteDecision]
+    # standalone question -> sub-queries (one per distinct part)
+    decompose: Callable[[str], list[str]]
     # search query -> corpus documents
     search_corpus: Callable[[str], list[Document]]
-    # (question, corpus documents) -> are they enough?
-    check_corpus: Callable[[str, list[Document]], CorpusCheck]
+    # (question, documents) -> relevant? one bool per document, same order
+    grade_documents: Callable[[str, list[Document]], list[bool]]
+    # (question, previous query, documents it found) -> new corpus query
+    rewrite_query: Callable[[str, str, list[Document]], str]
     # search query -> web documents
     search_web: Callable[[str], list[Document]]
+    # (question, parts the corpus didn't cover, documents already found)
+    #   -> new documents (web / live arXiv)
+    research: Callable[[str, list[str], list[Document]], list[Document]]
     # (question, prior conversation, documents) -> answer text
     generate: Callable[[str, list[AnyMessage], list[Document]], str]
 
 
 def make_components(config: AgentConfig) -> AgentComponents:
-    """Real components: OpenAI LLM, Pinecone corpus, Tavily web search.
+    """Real components: OpenAI LLMs, Pinecone corpus, Tavily web search,
+    live arXiv search (inside the research sub-agent).
 
     Builds network clients (Pinecone connects to the index here), so call it
     off the event loop in async contexts - see agent.graph.studio_graph.
     """
     llm = ChatOpenAI(model=config.llm_model, temperature=config.llm_temperature)
     router_llm = llm.with_structured_output(RouteDecision)
-    check_llm = llm.with_structured_output(CorpusCheck)
+    decompose_llm = llm.with_structured_output(SubQueries)
+    grader_llm = ChatOpenAI(model=config.grader_model, temperature=config.llm_temperature).with_structured_output(DocGrades)
     corpus_search = make_corpus_search(config)
     tavily = TavilySearch(max_results=config.web_search_max_results)
+    research = make_research(config, llm)
 
     def contextualize(question: str, history: list[AnyMessage]) -> str:
         return llm.invoke([SystemMessage(CONTEXTUALIZE_PROMPT), *history, HumanMessage(question)]).content.strip()
 
     def route(question: str) -> RouteDecision:
         return router_llm.invoke(ROUTER_PROMPT.format(question=question))
+
+    def decompose(question: str) -> list[str]:
+        result = decompose_llm.invoke(DECOMPOSE_PROMPT.format(question=question, max_sub_queries=config.max_sub_queries))
+        queries = [q.strip() for q in result.sub_queries if q.strip()]
+        return queries[: config.max_sub_queries] or [question]
 
     def search_corpus(query: str) -> list[Document]:
         return [
@@ -66,8 +91,16 @@ def make_components(config: AgentConfig) -> AgentComponents:
             for hit in corpus_search(query)
         ]
 
-    def check_corpus(question: str, documents: list[Document]) -> CorpusCheck:
-        return check_llm.invoke(CHECK_CORPUS_PROMPT.format(question=question, documents=format_documents(documents)))
+    def grade_documents(question: str, documents: list[Document]) -> list[bool]:
+        result = grader_llm.invoke(GRADE_DOCS_PROMPT.format(question=question, documents=format_documents(documents)))
+        # format_documents numbers documents from 1. A document the grader
+        # skipped counts as not relevant.
+        relevant = {g.index for g in result.grades if g.relevant}
+        return [i in relevant for i in range(1, len(documents) + 1)]
+
+    def rewrite_query(question: str, query: str, found: list[Document]) -> str:
+        titles = "\n".join(f"- {t}" for t in dict.fromkeys(d.title for d in found)) or "(none)"
+        return llm.invoke(REWRITE_QUERY_PROMPT.format(question=question, query=query, found=titles)).content.strip()
 
     def search_web(query: str) -> list[Document]:
         response = tavily.invoke({"query": query})
@@ -95,8 +128,11 @@ def make_components(config: AgentConfig) -> AgentComponents:
     return AgentComponents(
         contextualize=contextualize,
         route=route,
+        decompose=decompose,
         search_corpus=search_corpus,
-        check_corpus=check_corpus,
+        grade_documents=grade_documents,
+        rewrite_query=rewrite_query,
         search_web=search_web,
+        research=research,
         generate=generate,
     )

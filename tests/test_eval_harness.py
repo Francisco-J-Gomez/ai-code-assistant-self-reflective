@@ -37,6 +37,23 @@ def test_outputs_web_turn_keeps_corpus_ids_and_web_context():
     assert "[https://example.com] W\nweb text" in out["context"]
 
 
+def test_outputs_retrieval_metrics_use_everything_retrieved_not_only_graded_relevant():
+    state = _state("corpus", [PAPER_A])  # grading kept only PAPER_A...
+    state["retrieved"] = [PAPER_A, PAPER_B]  # ...out of what the corpus returned
+    out = outputs_from_state(state, _usage())
+    assert out["retrieved_ids"] == ["a", "b"]
+    assert "abstract b" not in out["context"]  # the judge sees what generate saw
+
+
+def test_outputs_live_arxiv_documents_are_context_but_not_corpus_retrieval():
+    live = Document(kind="arxiv", title="TL", url="https://arxiv.org/abs/l", text="live abstract", arxiv_id="l")
+    state = _state("web", [PAPER_A, live])
+    state["retrieved"] = [PAPER_A]
+    out = outputs_from_state(state, _usage())
+    assert out["retrieved_ids"] == ["a"]
+    assert "[l] TL\nlive abstract" in out["context"]
+
+
 def test_outputs_decline_turn():
     out = outputs_from_state(_state("decline", []), _usage(calls=1))
     assert out["route"] == "decline"

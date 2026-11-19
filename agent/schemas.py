@@ -1,7 +1,7 @@
 """Structured outputs the LLM-backed nodes ask the model for
 (`with_structured_output`). These are contracts with the LLM, not graph
 state: a node reads one of these and writes the relevant fields to
-AgentState. Later phases add theirs here (e.g. DocGrade, Critique).
+AgentState. Later phases add theirs here (e.g. Critique in Phase 4).
 """
 from typing import Literal
 
@@ -19,8 +19,22 @@ class RouteDecision(BaseModel):
     )
 
 
-class CorpusCheck(BaseModel):
-    """Output of check_corpus."""
+class SubQueries(BaseModel):
+    """Output of decompose."""
 
-    reasoning: str = Field(description="Brief justification, written before the verdict.")
-    answers_question: bool = Field(description="True if the papers contain information that actually answers the question.")
+    sub_queries: list[str] = Field(
+        description="One self-contained search query per distinct part of the question; "
+        "a single query if the question asks one thing."
+    )
+
+
+class DocGrade(BaseModel):
+    index: int = Field(description="The document's number in the list.")
+    reason: str = Field(description="A few words on why, written before the verdict.")
+    relevant: bool = Field(description="True if the document's text helps answer the question.")
+
+
+class DocGrades(BaseModel):
+    """Output of grade_docs: one grade per document, in one call."""
+
+    grades: list[DocGrade]

@@ -18,7 +18,7 @@ def sources_from_documents(documents: list[Document]) -> list[dict]:
             continue
         seen_urls.add(doc.url)
         source = {"kind": doc.kind, "title": doc.title, "url": doc.url}
-        if doc.kind == "corpus":
+        if doc.kind in ("corpus", "arxiv"):
             source["arxiv_id"] = doc.arxiv_id
         sources.append(source)
     return sources
@@ -26,10 +26,11 @@ def sources_from_documents(documents: list[Document]) -> list[dict]:
 
 def answer_badge(route: str | None) -> dict:
     """Which path the graph actually took this turn (not what the answer's
-    prose claims): "web" means the corpus was judged insufficient and the
-    answer includes a live web search."""
+    prose claims): "web" means the answer includes a live search - the
+    direct web route, or fallback_research (web and/or live arXiv) after the
+    corpus wasn't enough."""
     if route == "web":
-        return {"icon": "🌐", "label": "Includes live web search", "kind": "web"}
+        return {"icon": "🌐", "label": "Includes live search", "kind": "web"}
     if route == "corpus":
         return {"icon": "📄", "label": "Grounded in the paper corpus", "kind": "corpus"}
     return {"icon": "❌", "label": "Not grounded — no relevant source found", "kind": "none"}
