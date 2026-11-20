@@ -29,6 +29,12 @@ against the sources. Unsupported claims are revised away; parts of the
 question the draft skipped get one targeted search. After at most 3 drafts
 the best one is shown, with a note if it still didn't fully check out.
 
+While it works, the chat UI shows each step live — routing, the parts of
+the question, how many papers were relevant, query rewrites, live
+searches, fact-check results, revisions — so a 1–2 minute answer is never
+a silent spinner. The sidebar draws the agent's graph and lights up the
+nodes as they run, like LangGraph Studio.
+
 Each answer in the chat UI has a collapsible "Sources" list, labeled by
 whether it came from the corpus or the web, and a line saying whether it
 passed the fact-check.

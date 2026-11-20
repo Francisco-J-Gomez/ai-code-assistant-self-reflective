@@ -4,6 +4,7 @@
 """
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -31,6 +32,8 @@ except Exception:
 
 from agent.config import AgentConfig
 from agent.graph import build_graph
+from agent.graph_view import graph_dot
+from agent.progress import ProgressTracker
 from agent.results import answer_badge, self_check_note, sources_from_documents
 
 st.set_page_config(page_title="AI / Software-Dev Research Assistant", page_icon="📄")
@@ -151,11 +154,12 @@ st.caption(
 )
 
 if "agent" not in st.session_state:
-    st.session_state.agent = build_graph(AgentConfig())
+    st.session_state.agent_config = AgentConfig()
+    st.session_state.agent = build_graph(st.session_state.agent_config)
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 if "history" not in st.session_state:
-    st.session_state.history = []  # [{"role", "content", "sources"}]
+    st.session_state.history = []  # [{"role", "content", "sources", "badge", "check", "steps", "seconds"}]
 
 
 def _start_new_chat() -> None:
@@ -163,10 +167,23 @@ def _start_new_chat() -> None:
     # this conversation - no need to rebuild the graph/LLM connection.
     st.session_state.history = []
     st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.pop("last_visited", None)
 
 
 with st.sidebar:
     st.button("🆕  New Chat", on_click=_start_new_chat, use_container_width=True)
+    st.markdown("**How the agent works**")
+    st.caption("🟦 running · 🟩 done (×n = ran n times) · ⬜ not used. Shows the latest answer's path.")
+    graph_slot = st.empty()
+
+
+def _render_graph(visited=None, running=None) -> None:
+    if "graph_drawable" not in st.session_state:
+        st.session_state.graph_drawable = st.session_state.agent.get_graph(xray=True)
+    graph_slot.graphviz_chart(graph_dot(st.session_state.graph_drawable, visited, running), width="stretch")
+
+
+_render_graph(st.session_state.get("last_visited"))
 
 
 def _render_badge(badge: dict | None) -> None:
@@ -191,8 +208,51 @@ def _render_sources(sources: list[dict]) -> None:
                 st.markdown(f"🌐 [{source['title']}]({source['url']})")
 
 
+def _render_steps(steps: list[str], seconds: float) -> None:
+    """The finished run's log, collapsed, for answers already on screen."""
+    if not steps:
+        return
+    with st.expander(f"How this answer was made · {len(steps)} steps · {seconds:.0f}s"):
+        for step in steps:
+            st.markdown(f"- {step}")
+
+
+def _run_agent(question: str, config: dict) -> tuple[dict, list[str], float]:
+    """Run the graph, showing the current step live and logging each
+    finished one. Returns (final state, step log, seconds)."""
+    agent = st.session_state.agent
+    tracker = ProgressTracker(st.session_state.get("agent_config"))
+    start = time.monotonic()
+    with st.status(tracker.current, expanded=True) as status:
+        try:
+            for _namespace, event in agent.stream(
+                {"messages": [{"role": "user", "content": question}]},
+                config=config,
+                stream_mode="tasks",
+                subgraphs=True,  # also report the steps inside corpus_search
+            ):
+                line = tracker.update(event)
+                if line:
+                    status.write(line)
+                status.update(label=tracker.current)
+                _render_graph(tracker.visited, tracker.running)
+        except Exception:
+            status.update(label="Something went wrong", state="error")
+            raise
+        seconds = time.monotonic() - start
+        st.session_state.last_visited = dict(tracker.visited)
+        _render_graph(tracker.visited)
+        status.update(
+            label=f"How this answer was made · {len(tracker.steps)} steps · {seconds:.0f}s",
+            state="complete",
+            expanded=False,
+        )
+    return agent.get_state(config).values, tracker.steps, seconds
+
+
 for turn in st.session_state.history:
     with st.chat_message(turn["role"]):
+        _render_steps(turn.get("steps") or [], turn.get("seconds", 0))
         _render_badge(turn.get("badge"))
         st.markdown(turn["content"])
         _render_sources(turn.get("sources") or [])
@@ -206,11 +266,7 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            result = st.session_state.agent.invoke(
-                {"messages": [{"role": "user", "content": question}]},
-                config={"configurable": {"thread_id": st.session_state.thread_id}},
-            )
+        result, steps, seconds = _run_agent(question, {"configurable": {"thread_id": st.session_state.thread_id}})
 
         # documents/route are per-turn graph state (reset by contextualize each
         # turn), so they already describe only this answer.
@@ -226,5 +282,13 @@ if question:
             st.caption(check)
 
     st.session_state.history.append(
-        {"role": "assistant", "content": answer, "sources": sources, "badge": badge, "check": check}
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+            "badge": badge,
+            "check": check,
+            "steps": steps,
+            "seconds": seconds,
+        }
     )

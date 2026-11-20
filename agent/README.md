@@ -25,7 +25,12 @@ in the corpus (retrying with a rewritten query, then searching the web and
 live arXiv if too few are relevant), practical tool/library questions go
 straight to web search, and anything unrelated is declined. Every answer
 is fact-checked against its sources before it is shown (and revised if it
-isn't supported); a line under the answer says whether it passed. Each
+isn't supported); a line under the answer says whether it passed. While
+the agent works, a live status box shows the current step ("Part 2:
+checking which papers are relevant…", "Fact-checking the answer…") and logs
+each outcome; it then collapses into "How this answer was made". The
+sidebar shows the agent's graph (drawn from the compiled graph, like
+`langgraph dev`), colouring nodes live as running / done / not used. Each
 answer has a collapsible "Sources" list, deduplicated by URL and labeled by
 whether it came from the paper corpus or the web. The **New Chat** button
 starts a fresh conversation thread.
@@ -174,11 +179,13 @@ The UI and evals read the outcome from the final state: `route`
 | `prompts.py` | One narrow prompt per LLM node, the revision instructions built from a critique, the decline message and the caveat. |
 | `components.py` | `AgentComponents`: every external call the nodes make (LLMs, corpus, web, research sub-agent). Injected into `build_graph()` so control flow is unit-tested with fakes (`tests/test_graph.py`). |
 | `nodes.py` | The node functions `(state, components[, settings]) -> state update` and the routing functions for the conditional edges. |
-| `graph.py` | Wiring only: `build_graph()` (nodes, edges, `InMemorySaver` checkpointer), `build_corpus_search()` (the per-sub-query subgraph) and `studio_graph()` for `langgraph dev`. |
+| `graph.py` | Wiring only: `build_graph()` (nodes, edges, `InMemorySaver` checkpointer with our state types registered for deserialization), `build_corpus_search()` (the per-sub-query subgraph) and `studio_graph()` for `langgraph dev`. |
 | `retrieval.py` | `make_corpus_search()` (Pinecone query used by `retrieve_corpus`) and the `search_papers` tool wrapping it for tool-calling agents. |
 | `research.py` | The `fallback_research` sub-agent: `create_agent` + call-limit middleware, `web_search` and `arxiv_search` tools returning `Document`s. |
 | `results.py` | `sources_from_documents()` (deduplicated citations), `answer_badge()` (corpus / web / not-grounded badge) and `self_check_note()` (fact-check line) from the final state. Used by the UI; unit-tested. |
-| `../ui/chat_app.py` | Streamlit chat interface: session state, rendering, styling. |
+| `progress.py` | `ProgressTracker`: turns the graph's `tasks` stream (node start / finish events, including inside `corpus_search`) into the UI's current-step label and step log. Pure, unit-tested. |
+| `graph_view.py` | `graph_dot()`: the compiled graph (`get_graph(xray=True)`) as Graphviz DOT, coloured by the tracker's running / visited counters. Pure, unit-tested. |
+| `../ui/chat_app.py` | Streamlit chat interface: streams the graph into a live status box and the sidebar diagram, session state, rendering, styling. |
 
 Conversation memory is process-local (lost when the Streamlit server
 restarts), which is fine for local single-user use.
