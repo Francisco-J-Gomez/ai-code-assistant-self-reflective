@@ -41,12 +41,28 @@ import asyncio
 from functools import partial
 
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 
 from agent import nodes
 from agent.components import AgentComponents, make_components
 from agent.config import AgentConfig
 from agent.state import AgentState, CorpusSearchOutput, CorpusSearchState
+
+
+# Our own types stored in checkpointed state. LangGraph only restores types
+# it has been told about (unregistered ones log a warning now and will be
+# refused in a future version - which would break multi-turn chats).
+CHECKPOINT_TYPES = [
+    ("agent.state", "Document"),
+    ("agent.state", "SubQueryResult"),
+    ("agent.schemas", "Critique"),
+    ("agent.schemas", "ClaimCheck"),
+]
+
+
+def make_checkpointer() -> InMemorySaver:
+    return InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINT_TYPES))
 
 
 def build_graph(
@@ -66,7 +82,7 @@ def build_graph(
     config = config or AgentConfig()
     c = components or make_components(config)
     if checkpointer is None:
-        checkpointer = InMemorySaver()
+        checkpointer = make_checkpointer()
     elif checkpointer is False:
         checkpointer = None
 
